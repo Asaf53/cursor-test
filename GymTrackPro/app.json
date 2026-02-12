@@ -1,0 +1,66 @@
+{
+  "expo": {
+    "name": "GymTrack Pro",
+    "slug": "GymTrackPro",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "automatic",
+    "newArchEnabled": true,
+    "splash": {
+      "image": "./assets/splash-icon.png",
+      "resizeMode": "contain",
+      "backgroundColor": "#0A0A0F"
+    },
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.gymtrackpro.app",
+      "infoPlist": {
+        "NSCameraUsageDescription": "GymTrack Pro needs access to your camera to take progress photos.",
+        "NSPhotoLibraryUsageDescription": "GymTrack Pro needs access to your photo library to upload progress photos."
+      }
+    },
+    "android": {
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/adaptive-icon.png",
+        "backgroundColor": "#0A0A0F"
+      },
+      "edgeToEdgeEnabled": true,
+      "predictiveBackGestureEnabled": false,
+      "package": "com.gymtrackpro.app",
+      "permissions": [
+        "CAMERA",
+        "READ_EXTERNAL_STORAGE",
+        "WRITE_EXTERNAL_STORAGE",
+        "VIBRATE",
+        "RECEIVE_BOOT_COMPLETED"
+      ]
+    },
+    "web": {
+      "favicon": "./assets/favicon.png"
+    },
+    "plugins": [
+      "expo-font",
+      "expo-secure-store",
+      [
+        "expo-image-picker",
+        {
+          "photosPermission": "GymTrack Pro needs access to your photos to upload progress photos.",
+          "cameraPermission": "GymTrack Pro needs access to your camera to take progress photos."
+        }
+      ],
+      [
+        "expo-notifications",
+        {
+          "icon": "./assets/icon.png",
+          "color": "#1E90FF"
+        }
+      ]
+    ],
+    "extra": {
+      "eas": {
+        "projectId": "gymtrack-pro-app"
+      }
+    }
+  }
+}
