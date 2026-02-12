@@ -6,8 +6,9 @@ A modern, cross-platform gym tracking mobile application built with React Native
 
 ### Authentication
 - Email/password sign in & sign up
-- Google login (Firebase integration ready)
-- Apple login (Firebase integration ready)
+- Google OAuth login (via Supabase)
+- Apple OAuth login (via Supabase)
+- Password reset via email
 - Onboarding flow for new users
 
 ### Workout Tracking
@@ -70,11 +71,11 @@ A modern, cross-platform gym tracking mobile application built with React Native
 | Language | TypeScript |
 | Navigation | React Navigation (bottom tabs + native stack) |
 | State Management | React Context API |
-| Local Storage | AsyncStorage |
+| Local Storage | AsyncStorage + expo-secure-store |
+| Backend | **Supabase** (Auth, PostgreSQL, Storage) |
 | Notifications | Expo Notifications |
 | Image Picker | Expo Image Picker |
 | Icons | @expo/vector-icons (Ionicons) |
-| Backend (ready) | Firebase (Auth, Firestore, Storage, Analytics) |
 
 ## Project Structure
 
@@ -84,6 +85,7 @@ GymTrackPro/
 ├── app.json                         # Expo configuration
 ├── package.json                     # Dependencies
 ├── tsconfig.json                    # TypeScript configuration
+├── supabase-schema.sql              # Database schema + RLS policies
 ├── assets/                          # App icons and splash screens
 └── src/
     ├── components/                  # Reusable UI components
@@ -98,14 +100,15 @@ GymTrackPro/
     │   ├── exercises.ts             # Exercise library (60+ exercises)
     │   └── theme.ts                 # Theme colors, spacing, typography
     ├── contexts/
-    │   ├── AppContext.tsx            # Global app state & data management
+    │   ├── AppContext.tsx            # Global app state (Supabase + AsyncStorage)
     │   └── ThemeContext.tsx          # Dark/light theme management
-    ├── hooks/                       # Custom React hooks
+    ├── hooks/
+    │   └── useWorkoutAnalytics.ts   # Workout analytics hook
     ├── navigation/
     │   └── AppNavigator.tsx         # Navigation structure
     ├── screens/
     │   ├── Auth/
-    │   │   ├── LoginScreen.tsx      # Sign in screen
+    │   │   ├── LoginScreen.tsx      # Sign in + Google/Apple OAuth
     │   │   ├── SignUpScreen.tsx      # Registration screen
     │   │   └── OnboardingScreen.tsx  # New user onboarding
     │   ├── Dashboard/
@@ -114,11 +117,11 @@ GymTrackPro/
     │   │   ├── WorkoutsScreen.tsx    # Workout list & templates
     │   │   └── ActiveWorkoutScreen.tsx # Active workout tracking
     │   ├── Progress/
-    │   │   └── ProgressScreen.tsx    # Progress tracking (weight, measurements, photos, strength)
+    │   │   └── ProgressScreen.tsx    # Progress tracking
     │   └── Profile/
     │       └── ProfileScreen.tsx     # User profile, goals, settings
     ├── services/
-    │   ├── firebase.ts              # Firebase configuration template
+    │   ├── supabase.ts              # Supabase client, Auth, DB & Storage services
     │   └── notifications.ts         # Notification service
     ├── types/
     │   └── index.ts                 # TypeScript type definitions
@@ -134,6 +137,7 @@ GymTrackPro/
 - npm or yarn
 - Expo CLI (`npm install -g expo-cli`)
 - Expo Go app on your phone (for testing)
+- A Supabase project ([supabase.com](https://supabase.com))
 
 ### Installation
 
@@ -162,25 +166,67 @@ npx expo run:android
 npx expo start
 ```
 
-## Firebase Integration
+## Supabase Setup
 
-To enable full backend functionality:
+### 1. Create Project
 
-1. Create a Firebase project at [console.firebase.google.com](https://console.firebase.google.com)
-2. Enable Authentication providers (Email/Password, Google, Apple)
-3. Create a Firestore database
-4. Set up Firebase Storage
-5. Enable Firebase Analytics
-6. Install Firebase packages:
+Go to [supabase.com/dashboard](https://supabase.com/dashboard) and create a new project.
 
-```bash
-npx expo install @react-native-firebase/app @react-native-firebase/auth
-npx expo install @react-native-firebase/firestore @react-native-firebase/storage
-npx expo install @react-native-firebase/analytics
+### 2. Run Database Schema
+
+Open the **SQL Editor** in your Supabase dashboard and paste the contents of `supabase-schema.sql`. This creates all tables, indexes, RLS policies, and the auto-profile trigger.
+
+### 3. Add Your Credentials
+
+Open `src/services/supabase.ts` and replace the placeholder values:
+
+```typescript
+const SUPABASE_URL = 'https://YOUR_PROJECT_ID.supabase.co';
+const SUPABASE_ANON_KEY = 'YOUR_SUPABASE_ANON_KEY';
 ```
 
-7. Update `src/services/firebase.ts` with your Firebase config
-8. Add `google-services.json` (Android) and `GoogleService-Info.plist` (iOS)
+Find these in **Settings > API** in your Supabase dashboard.
+
+### 4. Enable Auth Providers
+
+In **Authentication > Providers**:
+
+- **Email**: Enabled by default
+- **Google**: Enable and add your Google OAuth client ID & secret
+- **Apple**: Enable and configure (iOS only)
+
+### 5. Set up Storage
+
+In **Storage**, create a bucket named `progress-photos` and set it to **public**. Then add RLS policies as described in `supabase-schema.sql`.
+
+### 6. Configure OAuth Redirect
+
+In **Authentication > URL Configuration**, add `gymtrackpro://auth/callback` to **Redirect URLs**.
+
+## Architecture
+
+### Offline-First with Supabase Sync
+
+- **AsyncStorage** is the local cache -- loaded first for instant UI
+- **Supabase** syncs in the background on login
+- Every write goes to local cache first, then Supabase (graceful offline fallback)
+- Auth state is driven by `supabase.auth.onAuthStateChange`
+- Auth tokens are stored encrypted using `expo-secure-store` + AES
+
+### Database Structure (PostgreSQL)
+
+| Table | Description |
+|-------|-------------|
+| `profiles` | User profile (auto-created on sign-up via trigger) |
+| `workouts` | Workout sessions with exercises stored as JSONB |
+| `body_weights` | Body weight log entries |
+| `measurements` | Body measurements (chest, arms, waist, legs) |
+| `personal_records` | Exercise personal records with estimated 1RM |
+| `goals` | Fitness goals |
+| `workout_templates` | Saved workout templates |
+| `custom_exercises` | User-created exercises |
+
+All tables have **Row Level Security** (RLS) so users can only access their own data.
 
 ## Future Roadmap
 
@@ -190,7 +236,6 @@ npx expo install @react-native-firebase/analytics
 - Trainer-client mode
 - Social features
 - Exercise video demonstrations
-- Advanced charts and reporting
 
 ## Target Audience
 

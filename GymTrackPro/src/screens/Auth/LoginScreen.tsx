@@ -1,5 +1,5 @@
 // ==========================================
-// GymTrack Pro - Login Screen
+// GymTrack Pro - Login Screen (Supabase)
 // ==========================================
 
 import React, { useState } from 'react';
@@ -12,9 +12,11 @@ import {
   KeyboardAvoidingView,
   Platform,
   Alert,
+  ActivityIndicator,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { Ionicons } from '@expo/vector-icons';
+import * as WebBrowser from 'expo-web-browser';
 import { useTheme } from '../../contexts/ThemeContext';
 import { useApp } from '../../contexts/AppContext';
 import { Button } from '../../components/Button';
@@ -23,10 +25,11 @@ import { FONT_SIZE, FONT_WEIGHT, SPACING, BORDER_RADIUS } from '../../constants/
 
 export const LoginScreen: React.FC<{ navigation: any }> = ({ navigation }) => {
   const { colors } = useTheme();
-  const { signIn } = useApp();
+  const { signIn, signInWithGoogle, signInWithApple, handleOAuthCallback, sendPasswordReset } = useApp();
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [loading, setLoading] = useState(false);
+  const [googleLoading, setGoogleLoading] = useState(false);
   const [errors, setErrors] = useState<{ email?: string; password?: string }>({});
 
   const validate = (): boolean => {
@@ -45,21 +48,85 @@ export const LoginScreen: React.FC<{ navigation: any }> = ({ navigation }) => {
     try {
       const success = await signIn(email.trim(), password);
       if (!success) {
-        Alert.alert('Login Failed', 'Please check your credentials and try again.');
+        Alert.alert(
+          'Login Failed',
+          'Invalid email or password. Please check your credentials and try again.'
+        );
       }
-    } catch (error) {
-      Alert.alert('Error', 'Something went wrong. Please try again.');
+    } catch (error: any) {
+      Alert.alert('Login Failed', error?.message || 'Something went wrong. Please try again.');
     } finally {
       setLoading(false);
     }
   };
 
-  const handleSocialLogin = (provider: string) => {
-    // In production, this would trigger Firebase social auth
+  const handleForgotPassword = () => {
+    if (!email.trim()) {
+      Alert.alert('Enter Email', 'Please enter your email address first, then tap Forgot Password.');
+      return;
+    }
     Alert.alert(
-      `${provider} Login`,
-      `${provider} login will be available with Firebase integration. For now, use email/password login.`
+      'Reset Password',
+      `Send a password reset link to ${email.trim()}?`,
+      [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'Send',
+          onPress: async () => {
+            const success = await sendPasswordReset(email.trim());
+            if (success) {
+              Alert.alert('Email Sent', 'Check your inbox for a password reset link.');
+            } else {
+              Alert.alert('Error', 'Could not send reset email. Please check the address and try again.');
+            }
+          },
+        },
+      ]
     );
+  };
+
+  const handleGoogleLogin = async () => {
+    setGoogleLoading(true);
+    try {
+      const result = await signInWithGoogle();
+      if (result?.url) {
+        // Open the Supabase Google OAuth URL in an in-app browser
+        const browserResult = await WebBrowser.openAuthSessionAsync(
+          result.url,
+          'gymtrackpro://auth/callback'
+        );
+        if (browserResult.type === 'success' && browserResult.url) {
+          await handleOAuthCallback(browserResult.url);
+        }
+      } else {
+        Alert.alert('Google Sign-In', 'Could not initiate Google Sign-In. Please try again.');
+      }
+    } catch (error: any) {
+      Alert.alert('Google Sign-In Failed', error?.message || 'Something went wrong.');
+    } finally {
+      setGoogleLoading(false);
+    }
+  };
+
+  const handleAppleLogin = async () => {
+    if (Platform.OS !== 'ios') {
+      Alert.alert('Apple Sign-In', 'Apple Sign-In is only available on iOS devices.');
+      return;
+    }
+    try {
+      const result = await signInWithApple();
+      if (result?.url) {
+        const browserResult = await WebBrowser.openAuthSessionAsync(
+          result.url,
+          'gymtrackpro://auth/callback'
+        );
+        if (browserResult.type === 'success' && browserResult.url) {
+          await handleOAuthCallback(browserResult.url);
+        }
+      }
+    } catch (error: any) {
+      Alert.alert('Apple Sign-In Failed', error?.message || 'Something went wrong.');
+    }
   };
 
   return (
@@ -106,7 +173,7 @@ export const LoginScreen: React.FC<{ navigation: any }> = ({ navigation }) => {
               error={errors.password}
             />
 
-            <TouchableOpacity style={styles.forgotPassword}>
+            <TouchableOpacity style={styles.forgotPassword} onPress={handleForgotPassword}>
               <Text style={[styles.forgotPasswordText, { color: colors.primary }]}>
                 Forgot Password?
               </Text>
@@ -134,19 +201,36 @@ export const LoginScreen: React.FC<{ navigation: any }> = ({ navigation }) => {
           {/* Social Login */}
           <View style={styles.socialContainer}>
             <TouchableOpacity
-              style={[styles.socialButton, { backgroundColor: colors.surface, borderColor: colors.border }]}
-              onPress={() => handleSocialLogin('Google')}
+              style={[
+                styles.socialButton,
+                {
+                  backgroundColor: colors.surface,
+                  borderColor: colors.border,
+                  opacity: googleLoading ? 0.6 : 1,
+                },
+              ]}
+              onPress={handleGoogleLogin}
+              disabled={loading || googleLoading}
             >
-              <Ionicons name="logo-google" size={22} color="#DB4437" />
-              <Text style={[styles.socialText, { color: colors.text }]}>Google</Text>
+              {googleLoading ? (
+                <ActivityIndicator size="small" color="#DB4437" />
+              ) : (
+                <Ionicons name="logo-google" size={22} color="#DB4437" />
+              )}
+              <Text style={[styles.socialText, { color: colors.text }]}>
+                {googleLoading ? 'Signing in...' : 'Google'}
+              </Text>
             </TouchableOpacity>
-            <TouchableOpacity
-              style={[styles.socialButton, { backgroundColor: colors.surface, borderColor: colors.border }]}
-              onPress={() => handleSocialLogin('Apple')}
-            >
-              <Ionicons name="logo-apple" size={22} color={colors.text} />
-              <Text style={[styles.socialText, { color: colors.text }]}>Apple</Text>
-            </TouchableOpacity>
+            {Platform.OS === 'ios' && (
+              <TouchableOpacity
+                style={[styles.socialButton, { backgroundColor: colors.surface, borderColor: colors.border }]}
+                onPress={handleAppleLogin}
+                disabled={loading || googleLoading}
+              >
+                <Ionicons name="logo-apple" size={22} color={colors.text} />
+                <Text style={[styles.socialText, { color: colors.text }]}>Apple</Text>
+              </TouchableOpacity>
+            )}
           </View>
 
           {/* Sign Up Link */}
@@ -167,93 +251,34 @@ export const LoginScreen: React.FC<{ navigation: any }> = ({ navigation }) => {
 };
 
 const styles = StyleSheet.create({
-  container: {
-    flex: 1,
-  },
-  flex: {
-    flex: 1,
-  },
+  container: { flex: 1 },
+  flex: { flex: 1 },
   scrollContent: {
     flexGrow: 1,
     paddingHorizontal: SPACING.xxl,
     paddingTop: SPACING.huge,
     paddingBottom: SPACING.xxxl,
   },
-  header: {
-    alignItems: 'center',
-    marginBottom: SPACING.xxxl,
-  },
+  header: { alignItems: 'center', marginBottom: SPACING.xxxl },
   logoContainer: {
-    width: 80,
-    height: 80,
-    borderRadius: BORDER_RADIUS.xl,
-    alignItems: 'center',
-    justifyContent: 'center',
-    marginBottom: SPACING.lg,
+    width: 80, height: 80, borderRadius: BORDER_RADIUS.xl,
+    alignItems: 'center', justifyContent: 'center', marginBottom: SPACING.lg,
   },
-  title: {
-    fontSize: FONT_SIZE.hero,
-    fontWeight: FONT_WEIGHT.heavy,
-    marginBottom: SPACING.xs,
-  },
-  subtitle: {
-    fontSize: FONT_SIZE.lg,
-    textAlign: 'center',
-  },
-  form: {
-    marginBottom: SPACING.xxl,
-  },
-  forgotPassword: {
-    alignSelf: 'flex-end',
-    marginBottom: SPACING.sm,
-  },
-  forgotPasswordText: {
-    fontSize: FONT_SIZE.sm,
-    fontWeight: FONT_WEIGHT.semibold,
-  },
-  dividerContainer: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    marginBottom: SPACING.xxl,
-  },
-  dividerLine: {
-    flex: 1,
-    height: 1,
-  },
-  dividerText: {
-    marginHorizontal: SPACING.lg,
-    fontSize: FONT_SIZE.sm,
-  },
-  socialContainer: {
-    flexDirection: 'row',
-    justifyContent: 'center',
-    gap: SPACING.md,
-    marginBottom: SPACING.xxxl,
-  },
+  title: { fontSize: FONT_SIZE.hero, fontWeight: FONT_WEIGHT.heavy, marginBottom: SPACING.xs },
+  subtitle: { fontSize: FONT_SIZE.lg, textAlign: 'center' },
+  form: { marginBottom: SPACING.xxl },
+  forgotPassword: { alignSelf: 'flex-end', marginBottom: SPACING.sm },
+  forgotPasswordText: { fontSize: FONT_SIZE.sm, fontWeight: FONT_WEIGHT.semibold },
+  dividerContainer: { flexDirection: 'row', alignItems: 'center', marginBottom: SPACING.xxl },
+  dividerLine: { flex: 1, height: 1 },
+  dividerText: { marginHorizontal: SPACING.lg, fontSize: FONT_SIZE.sm },
+  socialContainer: { flexDirection: 'row', justifyContent: 'center', gap: SPACING.md, marginBottom: SPACING.xxxl },
   socialButton: {
-    flex: 1,
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'center',
-    paddingVertical: SPACING.md,
-    borderRadius: BORDER_RADIUS.md,
-    borderWidth: 1,
-    gap: SPACING.sm,
+    flex: 1, flexDirection: 'row', alignItems: 'center', justifyContent: 'center',
+    paddingVertical: SPACING.md, borderRadius: BORDER_RADIUS.md, borderWidth: 1, gap: SPACING.sm,
   },
-  socialText: {
-    fontSize: FONT_SIZE.md,
-    fontWeight: FONT_WEIGHT.semibold,
-  },
-  signUpContainer: {
-    flexDirection: 'row',
-    justifyContent: 'center',
-    alignItems: 'center',
-  },
-  signUpText: {
-    fontSize: FONT_SIZE.md,
-  },
-  signUpLink: {
-    fontSize: FONT_SIZE.md,
-    fontWeight: FONT_WEIGHT.bold,
-  },
+  socialText: { fontSize: FONT_SIZE.md, fontWeight: FONT_WEIGHT.semibold },
+  signUpContainer: { flexDirection: 'row', justifyContent: 'center', alignItems: 'center' },
+  signUpText: { fontSize: FONT_SIZE.md },
+  signUpLink: { fontSize: FONT_SIZE.md, fontWeight: FONT_WEIGHT.bold },
 });
