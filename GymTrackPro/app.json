@@ -3,6 +3,7 @@
     "name": "GymTrack Pro",
     "slug": "GymTrackPro",
     "version": "1.0.0",
+    "scheme": "gymtrackpro",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "automatic",
@@ -63,7 +64,8 @@
           "icon": "./assets/icon.png",
           "color": "#1E90FF"
         }
-      ]
+      ],
+      "expo-web-browser"
     ],
     "extra": {
       "eas": {

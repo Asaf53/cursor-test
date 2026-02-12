@@ -2,7 +2,7 @@
 // GymTrack Pro - Login Screen
 // ==========================================
 
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import {
   View,
   Text,
@@ -12,14 +12,23 @@ import {
   KeyboardAvoidingView,
   Platform,
   Alert,
+  ActivityIndicator,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { Ionicons } from '@expo/vector-icons';
+import * as Google from 'expo-auth-session/providers/google';
+import * as WebBrowser from 'expo-web-browser';
 import { useTheme } from '../../contexts/ThemeContext';
 import { useApp } from '../../contexts/AppContext';
 import { Button } from '../../components/Button';
 import { Input } from '../../components/Input';
 import { FONT_SIZE, FONT_WEIGHT, SPACING, BORDER_RADIUS } from '../../constants/theme';
+
+// Required for expo-auth-session to close the browser on redirect
+WebBrowser.maybeCompleteAuthSession();
+
+// Firebase Google OAuth client IDs
+const IOS_CLIENT_ID = '294195477862-4hlduj9p5ap9n0kulqgl8j0olsfq2t97.apps.googleusercontent.com';
 
 export const LoginScreen: React.FC<{ navigation: any }> = ({ navigation }) => {
   const { colors } = useTheme();
@@ -27,8 +36,39 @@ export const LoginScreen: React.FC<{ navigation: any }> = ({ navigation }) => {
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [loading, setLoading] = useState(false);
-  const [socialLoading, setSocialLoading] = useState<string | null>(null);
+  const [googleLoading, setGoogleLoading] = useState(false);
   const [errors, setErrors] = useState<{ email?: string; password?: string }>({});
+
+  // Google Auth Session
+  const [request, response, promptAsync] = Google.useIdTokenAuthRequest({
+    iosClientId: IOS_CLIENT_ID,
+  });
+
+  // Handle Google sign-in response
+  useEffect(() => {
+    if (response?.type === 'success') {
+      const { id_token } = response.params;
+      handleGoogleToken(id_token);
+    } else if (response?.type === 'error') {
+      setGoogleLoading(false);
+      Alert.alert('Google Sign-In Failed', response.error?.message || 'Something went wrong.');
+    } else if (response?.type === 'dismiss') {
+      setGoogleLoading(false);
+    }
+  }, [response]);
+
+  const handleGoogleToken = async (idToken: string) => {
+    try {
+      const success = await signInWithGoogle(idToken);
+      if (!success) {
+        Alert.alert('Google Sign-In Failed', 'Could not sign in with Google. Please try again.');
+      }
+    } catch (error: any) {
+      Alert.alert('Google Sign-In Failed', error?.message || 'Something went wrong.');
+    } finally {
+      setGoogleLoading(false);
+    }
+  };
 
   const validate = (): boolean => {
     const newErrors: typeof errors = {};
@@ -92,39 +132,23 @@ export const LoginScreen: React.FC<{ navigation: any }> = ({ navigation }) => {
   };
 
   const handleGoogleLogin = async () => {
-    // Google Sign-In requires expo-auth-session or @react-native-google-signin
-    // to obtain the idToken. Once you have the idToken, call signInWithGoogle(idToken).
-    //
-    // For a production build, install & configure one of:
-    //   - expo-auth-session (works in Expo Go)
-    //   - @react-native-google-signin/google-signin (requires dev client)
-    //
-    // Quick example with expo-auth-session:
-    //   const [request, response, promptAsync] = Google.useAuthRequest({
-    //     iosClientId: '294195477862-4hlduj9p5ap9n0kulqgl8j0olsfq2t97.apps.googleusercontent.com',
-    //   });
-    //   const idToken = response?.authentication?.idToken;
-    //   await signInWithGoogle(idToken);
-    Alert.alert(
-      'Google Sign-In',
-      'Google Sign-In requires a native build. Use email/password for development, or build with EAS to enable Google login.'
-    );
+    setGoogleLoading(true);
+    try {
+      await promptAsync();
+    } catch (error) {
+      setGoogleLoading(false);
+      Alert.alert('Google Sign-In', 'Could not open Google Sign-In. Please try again.');
+    }
   };
 
   const handleAppleLogin = async () => {
-    // Apple Sign-In requires expo-apple-authentication.
-    //
-    // Example:
-    //   import * as AppleAuthentication from 'expo-apple-authentication';
-    //   const credential = await AppleAuthentication.signInAsync({...});
-    //   await signInWithApple(credential.identityToken, nonce);
     if (Platform.OS !== 'ios') {
       Alert.alert('Apple Sign-In', 'Apple Sign-In is only available on iOS devices.');
       return;
     }
     Alert.alert(
       'Apple Sign-In',
-      'Apple Sign-In requires a native build. Use email/password for development, or build with EAS to enable Apple login.'
+      'Apple Sign-In requires a native build with EAS. Use email/password or Google for now.'
     );
   };
 
@@ -200,18 +224,31 @@ export const LoginScreen: React.FC<{ navigation: any }> = ({ navigation }) => {
           {/* Social Login */}
           <View style={styles.socialContainer}>
             <TouchableOpacity
-              style={[styles.socialButton, { backgroundColor: colors.surface, borderColor: colors.border }]}
+              style={[
+                styles.socialButton,
+                {
+                  backgroundColor: colors.surface,
+                  borderColor: colors.border,
+                  opacity: googleLoading ? 0.6 : 1,
+                },
+              ]}
               onPress={handleGoogleLogin}
-              disabled={socialLoading !== null}
+              disabled={loading || googleLoading || !request}
             >
-              <Ionicons name="logo-google" size={22} color="#DB4437" />
-              <Text style={[styles.socialText, { color: colors.text }]}>Google</Text>
+              {googleLoading ? (
+                <ActivityIndicator size="small" color="#DB4437" />
+              ) : (
+                <Ionicons name="logo-google" size={22} color="#DB4437" />
+              )}
+              <Text style={[styles.socialText, { color: colors.text }]}>
+                {googleLoading ? 'Signing in...' : 'Google'}
+              </Text>
             </TouchableOpacity>
             {Platform.OS === 'ios' && (
               <TouchableOpacity
                 style={[styles.socialButton, { backgroundColor: colors.surface, borderColor: colors.border }]}
                 onPress={handleAppleLogin}
-                disabled={socialLoading !== null}
+                disabled={loading || googleLoading}
               >
                 <Ionicons name="logo-apple" size={22} color={colors.text} />
                 <Text style={[styles.socialText, { color: colors.text }]}>Apple</Text>
