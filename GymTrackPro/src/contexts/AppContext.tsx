@@ -54,7 +54,7 @@ interface AppContextType {
   user: User | null;
   supabaseUser: SupabaseUser | null;
   signIn: (email: string, password: string) => Promise<boolean>;
-  signUp: (email: string, password: string, name: string) => Promise<boolean>;
+  signUp: (email: string, password: string, name: string) => Promise<'signed_in' | 'needs_confirmation' | 'error'>;
   signInWithGoogle: () => Promise<{ url: string } | null>;
   signInWithApple: () => Promise<{ url: string } | null>;
   handleOAuthCallback: (url: string) => Promise<boolean>;
@@ -403,13 +403,19 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     }
   };
 
-  const signUp = async (email: string, password: string, name: string): Promise<boolean> => {
+  const signUp = async (email: string, password: string, name: string): Promise<'signed_in' | 'needs_confirmation' | 'error'> => {
     try {
-      await authService.signUpWithEmail(email, password, name);
-      return true;
+      const result = await authService.signUpWithEmail(email, password, name);
+      if (result.needsConfirmation) {
+        // User was created but needs to confirm their email
+        return 'needs_confirmation';
+      }
+      // Session was created immediately (email confirmation disabled in Supabase)
+      // onAuthStateChange will fire and handle the rest
+      return 'signed_in';
     } catch (error: any) {
       console.log('Sign up error:', error.message);
-      return false;
+      throw error; // Re-throw so the screen can show the right message
     }
   };
 

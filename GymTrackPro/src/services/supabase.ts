@@ -108,17 +108,34 @@ export const authService = {
     return data;
   },
 
-  /** Sign up with email & password */
+  /** Sign up with email & password.
+   *  Returns { user, session, needsConfirmation }.
+   *  If Supabase email confirmation is ON, session will be null. */
   signUpWithEmail: async (email: string, password: string, displayName: string) => {
     const { data, error } = await supabase.auth.signUp({
       email,
       password,
       options: {
         data: { display_name: displayName },
+        emailRedirectTo: 'gymtrackpro://auth/callback',
       },
     });
     if (error) throw error;
-    return data;
+    // Supabase returns a user but no session when email confirmation is required.
+    // It also returns a fake user with identities=[] if the email is already taken
+    // and confirmation is enabled (to prevent email enumeration).
+    const isAlreadyTaken =
+      data.user &&
+      data.user.identities &&
+      data.user.identities.length === 0;
+    if (isAlreadyTaken) {
+      throw new Error('An account with this email already exists.');
+    }
+    return {
+      user: data.user,
+      session: data.session,
+      needsConfirmation: data.user != null && data.session == null,
+    };
   },
 
   /** Sign in with Google OAuth (opens browser) */
