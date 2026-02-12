@@ -1,12 +1,11 @@
 // ==========================================
 // GymTrack Pro - App Data Context
-// Firebase-integrated with AsyncStorage cache
+// Supabase-integrated with AsyncStorage cache
 // ==========================================
 
 import React, { createContext, useContext, useState, useEffect, ReactNode } from 'react';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { v4 as uuidv4 } from 'uuid';
-import { User as FirebaseUser } from 'firebase/auth';
 import {
   User,
   UserProfile,
@@ -21,14 +20,19 @@ import {
   Goal,
   WorkoutTemplate,
   NotificationSettings,
-  FitnessGoal,
-  ExperienceLevel,
   SubscriptionPlan,
 } from '../types';
 import { DEFAULT_EXERCISES } from '../constants/exercises';
-import { authService, firestoreService, storageService } from '../services/firebase';
+import {
+  authService,
+  dbService,
+  storageService,
+  supabase,
+  Session,
+  SupabaseUser,
+} from '../services/supabase';
 
-// Storage Keys (used as local cache)
+// Local cache keys
 const STORAGE_KEYS = {
   USER: '@gymtrack_user',
   WORKOUTS: '@gymtrack_workouts',
@@ -48,11 +52,12 @@ interface AppContextType {
   isAuthenticated: boolean;
   hasOnboarded: boolean;
   user: User | null;
-  firebaseUser: FirebaseUser | null;
+  supabaseUser: SupabaseUser | null;
   signIn: (email: string, password: string) => Promise<boolean>;
   signUp: (email: string, password: string, name: string) => Promise<boolean>;
-  signInWithGoogle: (idToken: string) => Promise<boolean>;
-  signInWithApple: (identityToken: string, nonce: string) => Promise<boolean>;
+  signInWithGoogle: () => Promise<{ url: string } | null>;
+  signInWithApple: () => Promise<{ url: string } | null>;
+  handleOAuthCallback: (url: string) => Promise<boolean>;
   signOut: () => Promise<void>;
   sendPasswordReset: (email: string) => Promise<boolean>;
   completeOnboarding: (profile: Partial<UserProfile>) => Promise<void>;
@@ -128,25 +133,24 @@ const AppContext = createContext<AppContextType>({} as AppContextType);
 
 export const useApp = () => useContext(AppContext);
 
-// ---- Helper: build our internal User from a Firebase user ----
-const buildUser = (fbUser: FirebaseUser, profile?: Partial<UserProfile>): User => ({
-  id: fbUser.uid,
-  email: fbUser.email || '',
-  displayName: fbUser.displayName || fbUser.email?.split('@')[0] || 'User',
-  photoURL: fbUser.photoURL || undefined,
-  createdAt: fbUser.metadata.creationTime || new Date().toISOString(),
-  updatedAt: new Date().toISOString(),
+// Build app User from Supabase auth user + profile row
+const buildUser = (sbUser: SupabaseUser, profile?: Record<string, any> | null): User => ({
+  id: sbUser.id,
+  email: sbUser.email || '',
+  displayName: profile?.display_name || sbUser.user_metadata?.display_name || sbUser.email?.split('@')[0] || 'User',
+  photoURL: profile?.photo_url || sbUser.user_metadata?.avatar_url,
+  createdAt: sbUser.created_at || new Date().toISOString(),
+  updatedAt: profile?.updated_at || new Date().toISOString(),
   profile: {
-    name: fbUser.displayName || fbUser.email?.split('@')[0] || 'User',
-    age: null,
-    height: null,
-    weight: null,
-    goal: 'muscle_gain',
-    experienceLevel: 'beginner',
-    units: 'metric',
-    ...profile,
+    name: profile?.display_name || sbUser.user_metadata?.display_name || sbUser.email?.split('@')[0] || 'User',
+    age: profile?.age ?? null,
+    height: profile?.height ?? null,
+    weight: profile?.weight ?? null,
+    goal: profile?.goal || 'muscle_gain',
+    experienceLevel: profile?.experience_level || 'beginner',
+    units: profile?.units || 'metric',
   },
-  subscription: 'free',
+  subscription: profile?.subscription || 'free',
 });
 
 export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => {
@@ -154,7 +158,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
   const [isAuthenticated, setIsAuthenticated] = useState(false);
   const [hasOnboarded, setHasOnboarded] = useState(false);
   const [user, setUser] = useState<User | null>(null);
-  const [firebaseUser, setFirebaseUser] = useState<FirebaseUser | null>(null);
+  const [supabaseUser, setSupabaseUser] = useState<SupabaseUser | null>(null);
   const [workouts, setWorkouts] = useState<Workout[]>([]);
   const [activeWorkout, setActiveWorkout] = useState<Workout | null>(null);
   const [exercises, setExercises] = useState<Exercise[]>(DEFAULT_EXERCISES);
@@ -167,98 +171,71 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
   const [notificationSettings, setNotificationSettings] = useState<NotificationSettings>(defaultNotificationSettings);
 
   // ========================================
-  // Firebase Auth State Listener
+  // Supabase Auth State Listener
   // ========================================
   useEffect(() => {
-    const unsubscribe = authService.onAuthStateChanged(async (fbUser) => {
-      if (fbUser) {
-        setFirebaseUser(fbUser);
+    // Check for existing session on mount
+    authService.getSession().then((session) => {
+      if (session?.user) {
+        setSupabaseUser(session.user);
         setIsAuthenticated(true);
-        await handleUserLogin(fbUser);
-      } else {
-        setFirebaseUser(null);
-        setIsAuthenticated(false);
-        setUser(null);
+        handleUserLogin(session.user);
       }
       setIsLoading(false);
+    }).catch(() => setIsLoading(false));
+
+    // Listen for auth changes
+    const subscription = authService.onAuthStateChange((event, session) => {
+      if (event === 'SIGNED_IN' && session?.user) {
+        setSupabaseUser(session.user);
+        setIsAuthenticated(true);
+        handleUserLogin(session.user);
+      } else if (event === 'SIGNED_OUT') {
+        setSupabaseUser(null);
+        setIsAuthenticated(false);
+        setUser(null);
+      } else if (event === 'TOKEN_REFRESHED' && session?.user) {
+        setSupabaseUser(session.user);
+      }
     });
-    return unsubscribe;
+
+    return () => {
+      subscription.unsubscribe();
+    };
   }, []);
 
-  /**
-   * Called when Firebase confirms a user is logged in.
-   * Loads their profile from Firestore (or local cache), then loads all data.
-   */
-  const handleUserLogin = async (fbUser: FirebaseUser) => {
+  const handleUserLogin = async (sbUser: SupabaseUser) => {
     try {
-      // 1. Load local cache first for instant UI
+      // Load local cache first
       await loadLocalCache();
 
-      // 2. Try to get Firestore profile
-      let firestoreProfile: any = null;
+      // Fetch Supabase profile
+      let profile: Record<string, any> | null = null;
       try {
-        firestoreProfile = await firestoreService.getUserProfile(fbUser.uid);
+        profile = await dbService.getProfile(sbUser.id);
       } catch (err) {
-        console.log('Firestore profile fetch failed (offline?), using cache:', err);
+        console.log('Profile fetch failed (offline?):', err);
       }
 
-      if (firestoreProfile) {
-        const appUser: User = {
-          id: fbUser.uid,
-          email: fbUser.email || '',
-          displayName: firestoreProfile.displayName || fbUser.displayName || '',
-          photoURL: firestoreProfile.photoURL || fbUser.photoURL || undefined,
-          createdAt: firestoreProfile.createdAt?.toDate?.()?.toISOString?.() || fbUser.metadata.creationTime || '',
-          updatedAt: firestoreProfile.updatedAt?.toDate?.()?.toISOString?.() || '',
-          profile: firestoreProfile.profile || {
-            name: firestoreProfile.displayName || '',
-            age: null, height: null, weight: null,
-            goal: 'muscle_gain', experienceLevel: 'beginner', units: 'metric',
-          },
-          subscription: firestoreProfile.subscription || 'free',
-        };
-        setUser(appUser);
-        setHasOnboarded(firestoreProfile.hasOnboarded ?? false);
-        await AsyncStorage.setItem(STORAGE_KEYS.USER, JSON.stringify(appUser));
-        await AsyncStorage.setItem(STORAGE_KEYS.HAS_ONBOARDED, JSON.stringify(firestoreProfile.hasOnboarded ?? false));
-      } else {
-        // No Firestore profile yet -- use cached or build fresh
-        const cached = await AsyncStorage.getItem(STORAGE_KEYS.USER);
-        if (cached) {
-          setUser(JSON.parse(cached));
-        } else {
-          const newUser = buildUser(fbUser);
-          setUser(newUser);
-          await AsyncStorage.setItem(STORAGE_KEYS.USER, JSON.stringify(newUser));
-        }
-        const onboarded = await AsyncStorage.getItem(STORAGE_KEYS.HAS_ONBOARDED);
-        setHasOnboarded(onboarded ? JSON.parse(onboarded) : false);
-      }
+      const appUser = buildUser(sbUser, profile);
+      setUser(appUser);
+      setHasOnboarded(profile?.has_onboarded ?? false);
+      await AsyncStorage.setItem(STORAGE_KEYS.USER, JSON.stringify(appUser));
+      await AsyncStorage.setItem(STORAGE_KEYS.HAS_ONBOARDED, JSON.stringify(profile?.has_onboarded ?? false));
 
-      // 3. Background-sync collections from Firestore
-      syncFromFirestore(fbUser.uid);
+      // Background sync
+      syncFromSupabase(sbUser.id);
     } catch (error) {
       console.log('handleUserLogin error:', error);
     }
   };
 
-  /**
-   * Load everything from local AsyncStorage (fast, offline-first)
-   */
   const loadLocalCache = async () => {
     try {
       const [
-        storedUser,
-        storedOnboarded,
-        storedWorkouts,
-        storedExercises,
-        storedBodyWeights,
-        storedMeasurements,
-        storedPhotos,
-        storedRecords,
-        storedGoals,
-        storedTemplates,
-        storedNotifications,
+        storedUser, storedOnboarded, storedWorkouts, storedExercises,
+        storedBodyWeights, storedMeasurements, storedPhotos, storedRecords,
+        storedGoals, storedTemplates, storedNotifications,
       ] = await Promise.all([
         AsyncStorage.getItem(STORAGE_KEYS.USER),
         AsyncStorage.getItem(STORAGE_KEYS.HAS_ONBOARDED),
@@ -292,69 +269,125 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     }
   };
 
-  /**
-   * Pull latest data from Firestore and merge into state + local cache.
-   * Runs in the background so the UI isn't blocked.
-   */
-  const syncFromFirestore = async (userId: string) => {
+  const syncFromSupabase = async (userId: string) => {
     try {
-      const [
-        fsWorkouts,
-        fsBodyWeights,
-        fsMeasurements,
-        fsRecords,
-        fsGoals,
-        fsTemplates,
-        fsExercises,
-        fsNotifications,
-      ] = await Promise.allSettled([
-        firestoreService.getWorkouts(userId),
-        firestoreService.getBodyWeights(userId),
-        firestoreService.getMeasurements(userId),
-        firestoreService.getPersonalRecords(userId),
-        firestoreService.getGoals(userId),
-        firestoreService.getTemplates(userId),
-        firestoreService.getCustomExercises(userId),
-        firestoreService.getNotificationSettings(userId),
+      const results = await Promise.allSettled([
+        dbService.getWorkouts(userId),
+        dbService.getBodyWeights(userId),
+        dbService.getMeasurements(userId),
+        dbService.getPersonalRecords(userId),
+        dbService.getGoals(userId),
+        dbService.getTemplates(userId),
+        dbService.getCustomExercises(userId),
       ]);
 
-      if (fsWorkouts.status === 'fulfilled' && fsWorkouts.value.length > 0) {
-        setWorkouts(fsWorkouts.value as Workout[]);
-        await AsyncStorage.setItem(STORAGE_KEYS.WORKOUTS, JSON.stringify(fsWorkouts.value));
+      const [rWorkouts, rWeights, rMeasures, rRecords, rGoals, rTemplates, rExercises] = results;
+
+      if (rWorkouts.status === 'fulfilled' && rWorkouts.value.length > 0) {
+        // Map snake_case DB rows to camelCase app types
+        const mapped = rWorkouts.value.map(mapWorkoutFromDb);
+        setWorkouts(mapped);
+        await AsyncStorage.setItem(STORAGE_KEYS.WORKOUTS, JSON.stringify(mapped));
       }
-      if (fsBodyWeights.status === 'fulfilled' && fsBodyWeights.value.length > 0) {
-        setBodyWeights(fsBodyWeights.value as BodyWeight[]);
-        await AsyncStorage.setItem(STORAGE_KEYS.BODY_WEIGHTS, JSON.stringify(fsBodyWeights.value));
+      if (rWeights.status === 'fulfilled' && rWeights.value.length > 0) {
+        const mapped = rWeights.value.map(mapBodyWeightFromDb);
+        setBodyWeights(mapped);
+        await AsyncStorage.setItem(STORAGE_KEYS.BODY_WEIGHTS, JSON.stringify(mapped));
       }
-      if (fsMeasurements.status === 'fulfilled' && fsMeasurements.value.length > 0) {
-        setMeasurements(fsMeasurements.value as BodyMeasurement[]);
-        await AsyncStorage.setItem(STORAGE_KEYS.MEASUREMENTS, JSON.stringify(fsMeasurements.value));
+      if (rMeasures.status === 'fulfilled' && rMeasures.value.length > 0) {
+        const mapped = rMeasures.value.map(mapMeasurementFromDb);
+        setMeasurements(mapped);
+        await AsyncStorage.setItem(STORAGE_KEYS.MEASUREMENTS, JSON.stringify(mapped));
       }
-      if (fsRecords.status === 'fulfilled' && fsRecords.value.length > 0) {
-        setPersonalRecords(fsRecords.value as PersonalRecord[]);
-        await AsyncStorage.setItem(STORAGE_KEYS.RECORDS, JSON.stringify(fsRecords.value));
+      if (rRecords.status === 'fulfilled' && rRecords.value.length > 0) {
+        const mapped = rRecords.value.map(mapRecordFromDb);
+        setPersonalRecords(mapped);
+        await AsyncStorage.setItem(STORAGE_KEYS.RECORDS, JSON.stringify(mapped));
       }
-      if (fsGoals.status === 'fulfilled' && fsGoals.value.length > 0) {
-        setGoals(fsGoals.value as Goal[]);
-        await AsyncStorage.setItem(STORAGE_KEYS.GOALS, JSON.stringify(fsGoals.value));
+      if (rGoals.status === 'fulfilled' && rGoals.value.length > 0) {
+        const mapped = rGoals.value.map(mapGoalFromDb);
+        setGoals(mapped);
+        await AsyncStorage.setItem(STORAGE_KEYS.GOALS, JSON.stringify(mapped));
       }
-      if (fsTemplates.status === 'fulfilled' && fsTemplates.value.length > 0) {
-        setTemplates(fsTemplates.value as WorkoutTemplate[]);
-        await AsyncStorage.setItem(STORAGE_KEYS.TEMPLATES, JSON.stringify(fsTemplates.value));
+      if (rTemplates.status === 'fulfilled' && rTemplates.value.length > 0) {
+        const mapped = rTemplates.value.map(mapTemplateFromDb);
+        setTemplates(mapped);
+        await AsyncStorage.setItem(STORAGE_KEYS.TEMPLATES, JSON.stringify(mapped));
       }
-      if (fsExercises.status === 'fulfilled' && fsExercises.value.length > 0) {
-        const custom = fsExercises.value as Exercise[];
-        setExercises([...DEFAULT_EXERCISES, ...custom]);
-        await AsyncStorage.setItem(STORAGE_KEYS.EXERCISES, JSON.stringify(custom));
-      }
-      if (fsNotifications.status === 'fulfilled' && fsNotifications.value) {
-        setNotificationSettings(fsNotifications.value as NotificationSettings);
-        await AsyncStorage.setItem(STORAGE_KEYS.NOTIFICATIONS, JSON.stringify(fsNotifications.value));
+      if (rExercises.status === 'fulfilled' && rExercises.value.length > 0) {
+        const mapped = rExercises.value.map(mapExerciseFromDb);
+        setExercises([...DEFAULT_EXERCISES, ...mapped]);
+        await AsyncStorage.setItem(STORAGE_KEYS.EXERCISES, JSON.stringify(mapped));
       }
     } catch (error) {
-      console.log('syncFromFirestore error (non-critical):', error);
+      console.log('syncFromSupabase error (non-critical):', error);
     }
   };
+
+  // ========================================
+  // DB row <-> App type mappers
+  // ========================================
+  const mapWorkoutFromDb = (row: any): Workout => ({
+    id: row.id,
+    userId: row.user_id,
+    name: row.name,
+    date: row.date,
+    startTime: row.start_time,
+    endTime: row.end_time,
+    duration: row.duration,
+    exercises: row.exercises || [],
+    notes: row.notes,
+    caloriesEstimate: row.calories_estimate,
+    isCompleted: row.is_completed,
+    createdAt: row.created_at,
+  });
+
+  const mapWorkoutToDb = (w: Workout) => ({
+    id: w.id,
+    user_id: w.userId,
+    name: w.name,
+    date: w.date,
+    start_time: w.startTime,
+    end_time: w.endTime,
+    duration: w.duration,
+    exercises: w.exercises,
+    notes: w.notes,
+    calories_estimate: w.caloriesEstimate,
+    is_completed: w.isCompleted,
+  });
+
+  const mapBodyWeightFromDb = (row: any): BodyWeight => ({
+    id: row.id, userId: row.user_id, weight: row.weight, date: row.date, notes: row.notes,
+  });
+
+  const mapMeasurementFromDb = (row: any): BodyMeasurement => ({
+    id: row.id, userId: row.user_id, date: row.date,
+    chest: row.chest, arms: row.arms, waist: row.waist, legs: row.legs, notes: row.notes,
+  });
+
+  const mapRecordFromDb = (row: any): PersonalRecord => ({
+    id: row.id, userId: row.user_id, exerciseId: row.exercise_id,
+    exerciseName: row.exercise_name, weight: row.weight, reps: row.reps,
+    date: row.date, oneRepMax: row.one_rep_max,
+  });
+
+  const mapGoalFromDb = (row: any): Goal => ({
+    id: row.id, userId: row.user_id, type: row.type, title: row.title,
+    description: row.description, targetValue: row.target_value,
+    currentValue: row.current_value, unit: row.unit, deadline: row.deadline,
+    isCompleted: row.is_completed, createdAt: row.created_at,
+  });
+
+  const mapTemplateFromDb = (row: any): WorkoutTemplate => ({
+    id: row.id, userId: row.user_id, name: row.name,
+    exercises: row.exercises || [], createdAt: row.created_at,
+    lastUsed: row.last_used, timesUsed: row.times_used,
+  });
+
+  const mapExerciseFromDb = (row: any): Exercise => ({
+    id: row.id, name: row.name, muscleGroup: row.muscle_group,
+    category: row.category, isCustom: true, description: row.description,
+  });
 
   // ========================================
   // Authentication
@@ -363,91 +396,61 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
   const signIn = async (email: string, password: string): Promise<boolean> => {
     try {
       await authService.signInWithEmail(email, password);
-      // onAuthStateChanged will fire and call handleUserLogin
       return true;
     } catch (error: any) {
-      console.log('Sign in error:', error.code, error.message);
+      console.log('Sign in error:', error.message);
       return false;
     }
   };
 
   const signUp = async (email: string, password: string, name: string): Promise<boolean> => {
     try {
-      const fbUser = await authService.signUpWithEmail(email, password, name);
-      // Create Firestore user profile
-      const newUser = buildUser(fbUser, { name });
-      await firestoreService.createUserProfile(fbUser.uid, {
-        displayName: name,
-        email,
-        profile: newUser.profile,
-        subscription: 'free',
-        hasOnboarded: false,
-      });
-      setUser(newUser);
-      setHasOnboarded(false);
-      await AsyncStorage.setItem(STORAGE_KEYS.USER, JSON.stringify(newUser));
-      await AsyncStorage.setItem(STORAGE_KEYS.HAS_ONBOARDED, JSON.stringify(false));
+      await authService.signUpWithEmail(email, password, name);
       return true;
     } catch (error: any) {
-      console.log('Sign up error:', error.code, error.message);
+      console.log('Sign up error:', error.message);
       return false;
     }
   };
 
-  const signInWithGoogle = async (idToken: string): Promise<boolean> => {
+  const signInWithGoogle = async (): Promise<{ url: string } | null> => {
     try {
-      const fbUser = await authService.signInWithGoogle(idToken);
-      // Check if profile exists; create if new
-      const existing = await firestoreService.getUserProfile(fbUser.uid);
-      if (!existing) {
-        const newUser = buildUser(fbUser);
-        await firestoreService.createUserProfile(fbUser.uid, {
-          displayName: fbUser.displayName || '',
-          email: fbUser.email || '',
-          photoURL: fbUser.photoURL || '',
-          profile: newUser.profile,
-          subscription: 'free',
-          hasOnboarded: false,
-        });
-      }
-      return true;
+      const data = await authService.signInWithGoogle();
+      if (data?.url) return { url: data.url };
+      return null;
     } catch (error: any) {
-      console.log('Google sign-in error:', error.code, error.message);
-      return false;
+      console.log('Google sign-in error:', error.message);
+      return null;
     }
   };
 
-  const signInWithApple = async (identityToken: string, nonce: string): Promise<boolean> => {
+  const signInWithApple = async (): Promise<{ url: string } | null> => {
     try {
-      const fbUser = await authService.signInWithApple(identityToken, nonce);
-      const existing = await firestoreService.getUserProfile(fbUser.uid);
-      if (!existing) {
-        const newUser = buildUser(fbUser);
-        await firestoreService.createUserProfile(fbUser.uid, {
-          displayName: fbUser.displayName || '',
-          email: fbUser.email || '',
-          profile: newUser.profile,
-          subscription: 'free',
-          hasOnboarded: false,
-        });
-      }
+      const data = await authService.signInWithApple();
+      if (data?.url) return { url: data.url };
+      return null;
+    } catch (error: any) {
+      console.log('Apple sign-in error:', error.message);
+      return null;
+    }
+  };
+
+  const handleOAuthCallback = async (url: string): Promise<boolean> => {
+    try {
+      await authService.setSessionFromUrl(url);
       return true;
     } catch (error: any) {
-      console.log('Apple sign-in error:', error.code, error.message);
+      console.log('OAuth callback error:', error.message);
       return false;
     }
   };
 
   const signOut = async () => {
-    try {
-      await authService.signOut();
-    } catch (error) {
-      console.log('Sign out error:', error);
-    }
+    try { await authService.signOut(); } catch (e) { console.log('Sign out error:', e); }
     setIsAuthenticated(false);
     setHasOnboarded(false);
     setUser(null);
-    setFirebaseUser(null);
+    setSupabaseUser(null);
     setWorkouts([]);
     setActiveWorkout(null);
     setBodyWeights([]);
@@ -460,37 +463,31 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
   };
 
   const sendPasswordReset = async (email: string): Promise<boolean> => {
-    try {
-      await authService.sendPasswordReset(email);
-      return true;
-    } catch (error) {
-      console.log('Password reset error:', error);
-      return false;
-    }
+    try { await authService.sendPasswordReset(email); return true; }
+    catch { return false; }
   };
 
   const completeOnboarding = async (profile: Partial<UserProfile>) => {
-    if (user) {
-      const updatedUser = {
-        ...user,
-        profile: { ...user.profile, ...profile },
-        updatedAt: new Date().toISOString(),
-      };
-      setUser(updatedUser);
-      setHasOnboarded(true);
-      await AsyncStorage.setItem(STORAGE_KEYS.USER, JSON.stringify(updatedUser));
-      await AsyncStorage.setItem(STORAGE_KEYS.HAS_ONBOARDED, JSON.stringify(true));
-
-      // Persist to Firestore
-      try {
-        await firestoreService.updateUserProfile(user.id, {
-          profile: updatedUser.profile,
-          hasOnboarded: true,
-        });
-      } catch (err) {
-        console.log('Firestore onboarding update failed (will sync later):', err);
-      }
-    }
+    if (!user) return;
+    const updatedUser = { ...user, profile: { ...user.profile, ...profile }, updatedAt: new Date().toISOString() };
+    setUser(updatedUser);
+    setHasOnboarded(true);
+    await AsyncStorage.setItem(STORAGE_KEYS.USER, JSON.stringify(updatedUser));
+    await AsyncStorage.setItem(STORAGE_KEYS.HAS_ONBOARDED, JSON.stringify(true));
+    try {
+      await dbService.upsertProfile({
+        id: user.id,
+        display_name: updatedUser.profile.name,
+        age: updatedUser.profile.age,
+        height: updatedUser.profile.height,
+        weight: updatedUser.profile.weight,
+        goal: updatedUser.profile.goal,
+        experience_level: updatedUser.profile.experienceLevel,
+        units: updatedUser.profile.units,
+        has_onboarded: true,
+        updated_at: new Date().toISOString(),
+      });
+    } catch (err) { console.log('Supabase onboarding update failed:', err); }
   };
 
   // ========================================
@@ -498,38 +495,37 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
   // ========================================
 
   const updateProfileFn = async (profile: Partial<UserProfile>) => {
-    if (user) {
-      const updatedUser = {
-        ...user,
-        profile: { ...user.profile, ...profile },
-        displayName: profile.name || user.displayName,
-        updatedAt: new Date().toISOString(),
-      };
-      setUser(updatedUser);
-      await AsyncStorage.setItem(STORAGE_KEYS.USER, JSON.stringify(updatedUser));
-
-      try {
-        await firestoreService.updateUserProfile(user.id, {
-          profile: updatedUser.profile,
-          displayName: updatedUser.displayName,
-        });
-      } catch (err) {
-        console.log('Firestore profile update failed:', err);
-      }
-    }
+    if (!user) return;
+    const updatedUser = {
+      ...user,
+      profile: { ...user.profile, ...profile },
+      displayName: profile.name || user.displayName,
+      updatedAt: new Date().toISOString(),
+    };
+    setUser(updatedUser);
+    await AsyncStorage.setItem(STORAGE_KEYS.USER, JSON.stringify(updatedUser));
+    try {
+      await dbService.upsertProfile({
+        id: user.id,
+        display_name: updatedUser.displayName,
+        age: updatedUser.profile.age,
+        height: updatedUser.profile.height,
+        weight: updatedUser.profile.weight,
+        goal: updatedUser.profile.goal,
+        experience_level: updatedUser.profile.experienceLevel,
+        units: updatedUser.profile.units,
+        updated_at: new Date().toISOString(),
+      });
+    } catch (err) { console.log('Supabase profile update failed:', err); }
   };
 
   const updateSubscription = async (plan: SubscriptionPlan) => {
-    if (user) {
-      const updatedUser = { ...user, subscription: plan, updatedAt: new Date().toISOString() };
-      setUser(updatedUser);
-      await AsyncStorage.setItem(STORAGE_KEYS.USER, JSON.stringify(updatedUser));
-      try {
-        await firestoreService.updateUserProfile(user.id, { subscription: plan });
-      } catch (err) {
-        console.log('Firestore subscription update failed:', err);
-      }
-    }
+    if (!user) return;
+    const updatedUser = { ...user, subscription: plan, updatedAt: new Date().toISOString() };
+    setUser(updatedUser);
+    await AsyncStorage.setItem(STORAGE_KEYS.USER, JSON.stringify(updatedUser));
+    try { await dbService.upsertProfile({ id: user.id, subscription: plan }); }
+    catch (err) { console.log('Supabase subscription update failed:', err); }
   };
 
   // ========================================
@@ -539,178 +535,110 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
   const startWorkout = (name: string, _templateId?: string): Workout => {
     const now = new Date().toISOString();
     const workout: Workout = {
-      id: uuidv4(),
-      userId: user?.id || '',
-      name,
-      date: now.split('T')[0],
-      startTime: now,
-      exercises: [],
-      isCompleted: false,
-      createdAt: now,
+      id: uuidv4(), userId: user?.id || '', name, date: now.split('T')[0],
+      startTime: now, exercises: [], isCompleted: false, createdAt: now,
     };
     setActiveWorkout(workout);
     return workout;
   };
 
   const finishWorkout = async (workoutId: string) => {
-    if (activeWorkout && activeWorkout.id === workoutId) {
-      const now = new Date();
-      const start = new Date(activeWorkout.startTime);
-      const duration = Math.round((now.getTime() - start.getTime()) / 1000);
-      const completedWorkout: Workout = {
-        ...activeWorkout,
-        endTime: now.toISOString(),
-        duration,
-        isCompleted: true,
-        caloriesEstimate: estimateCalories(activeWorkout, duration),
-      };
-
-      const updatedWorkouts = [completedWorkout, ...workouts];
-      setWorkouts(updatedWorkouts);
-      setActiveWorkout(null);
-      await AsyncStorage.setItem(STORAGE_KEYS.WORKOUTS, JSON.stringify(updatedWorkouts));
-
-      // Save to Firestore
-      try {
-        if (user) await firestoreService.saveWorkout(user.id, completedWorkout);
-      } catch (err) {
-        console.log('Firestore workout save failed:', err);
-      }
-
-      // Check for personal records
-      await checkPersonalRecords(completedWorkout);
-    }
-  };
-
-  const cancelWorkout = () => {
+    if (!activeWorkout || activeWorkout.id !== workoutId) return;
+    const now = new Date();
+    const start = new Date(activeWorkout.startTime);
+    const duration = Math.round((now.getTime() - start.getTime()) / 1000);
+    const completedWorkout: Workout = {
+      ...activeWorkout, endTime: now.toISOString(), duration,
+      isCompleted: true, caloriesEstimate: estimateCalories(activeWorkout, duration),
+    };
+    const updatedWorkouts = [completedWorkout, ...workouts];
+    setWorkouts(updatedWorkouts);
     setActiveWorkout(null);
+    await AsyncStorage.setItem(STORAGE_KEYS.WORKOUTS, JSON.stringify(updatedWorkouts));
+    try { if (user) await dbService.saveWorkout(mapWorkoutToDb(completedWorkout)); }
+    catch (err) { console.log('Supabase workout save failed:', err); }
+    await checkPersonalRecords(completedWorkout);
   };
+
+  const cancelWorkout = () => { setActiveWorkout(null); };
 
   const addExerciseToWorkout = (workoutId: string, exercise: Exercise) => {
-    if (activeWorkout && activeWorkout.id === workoutId) {
-      const workoutExercise: WorkoutExercise = {
-        id: uuidv4(),
-        exerciseId: exercise.id,
-        exerciseName: exercise.name,
-        muscleGroup: exercise.muscleGroup,
-        sets: [
-          {
-            id: uuidv4(),
-            setNumber: 1,
-            reps: null,
-            weight: null,
-            isCompleted: false,
-            type: 'normal',
-          },
-        ],
-        restTimerSeconds: 90,
-        order: activeWorkout.exercises.length,
-      };
-      setActiveWorkout({
-        ...activeWorkout,
-        exercises: [...activeWorkout.exercises, workoutExercise],
-      });
-    }
+    if (!activeWorkout || activeWorkout.id !== workoutId) return;
+    const we: WorkoutExercise = {
+      id: uuidv4(), exerciseId: exercise.id, exerciseName: exercise.name,
+      muscleGroup: exercise.muscleGroup,
+      sets: [{ id: uuidv4(), setNumber: 1, reps: null, weight: null, isCompleted: false, type: 'normal' }],
+      restTimerSeconds: 90, order: activeWorkout.exercises.length,
+    };
+    setActiveWorkout({ ...activeWorkout, exercises: [...activeWorkout.exercises, we] });
   };
 
   const removeExerciseFromWorkout = (workoutId: string, exerciseId: string) => {
-    if (activeWorkout && activeWorkout.id === workoutId) {
-      setActiveWorkout({
-        ...activeWorkout,
-        exercises: activeWorkout.exercises.filter(e => e.id !== exerciseId),
-      });
-    }
+    if (!activeWorkout || activeWorkout.id !== workoutId) return;
+    setActiveWorkout({ ...activeWorkout, exercises: activeWorkout.exercises.filter(e => e.id !== exerciseId) });
   };
 
   const addSetToExercise = (workoutId: string, exerciseId: string) => {
-    if (activeWorkout && activeWorkout.id === workoutId) {
-      const updatedExercises = activeWorkout.exercises.map(ex => {
-        if (ex.id === exerciseId) {
-          const lastSet = ex.sets[ex.sets.length - 1];
-          return {
-            ...ex,
-            sets: [
-              ...ex.sets,
-              {
-                id: uuidv4(),
-                setNumber: ex.sets.length + 1,
-                reps: lastSet?.reps || null,
-                weight: lastSet?.weight || null,
-                isCompleted: false,
-                type: 'normal' as const,
-              },
-            ],
-          };
-        }
-        return ex;
-      });
-      setActiveWorkout({ ...activeWorkout, exercises: updatedExercises });
-    }
+    if (!activeWorkout || activeWorkout.id !== workoutId) return;
+    setActiveWorkout({
+      ...activeWorkout,
+      exercises: activeWorkout.exercises.map(ex => {
+        if (ex.id !== exerciseId) return ex;
+        const last = ex.sets[ex.sets.length - 1];
+        return { ...ex, sets: [...ex.sets, { id: uuidv4(), setNumber: ex.sets.length + 1, reps: last?.reps || null, weight: last?.weight || null, isCompleted: false, type: 'normal' as const }] };
+      }),
+    });
   };
 
   const removeSetFromExercise = (workoutId: string, exerciseId: string, setId: string) => {
-    if (activeWorkout && activeWorkout.id === workoutId) {
-      const updatedExercises = activeWorkout.exercises.map(ex => {
-        if (ex.id === exerciseId) {
-          const filteredSets = ex.sets.filter(s => s.id !== setId);
-          return {
-            ...ex,
-            sets: filteredSets.map((s, i) => ({ ...s, setNumber: i + 1 })),
-          };
-        }
-        return ex;
-      });
-      setActiveWorkout({ ...activeWorkout, exercises: updatedExercises });
-    }
+    if (!activeWorkout || activeWorkout.id !== workoutId) return;
+    setActiveWorkout({
+      ...activeWorkout,
+      exercises: activeWorkout.exercises.map(ex => {
+        if (ex.id !== exerciseId) return ex;
+        const filtered = ex.sets.filter(s => s.id !== setId);
+        return { ...ex, sets: filtered.map((s, i) => ({ ...s, setNumber: i + 1 })) };
+      }),
+    });
   };
 
   const updateSet = (workoutId: string, exerciseId: string, setId: string, updates: Partial<ExerciseSet>) => {
-    if (activeWorkout && activeWorkout.id === workoutId) {
-      const updatedExercises = activeWorkout.exercises.map(ex => {
-        if (ex.id === exerciseId) {
-          return {
-            ...ex,
-            sets: ex.sets.map(s => (s.id === setId ? { ...s, ...updates } : s)),
-          };
-        }
-        return ex;
-      });
-      setActiveWorkout({ ...activeWorkout, exercises: updatedExercises });
-    }
+    if (!activeWorkout || activeWorkout.id !== workoutId) return;
+    setActiveWorkout({
+      ...activeWorkout,
+      exercises: activeWorkout.exercises.map(ex => {
+        if (ex.id !== exerciseId) return ex;
+        return { ...ex, sets: ex.sets.map(s => s.id === setId ? { ...s, ...updates } : s) };
+      }),
+    });
   };
 
   const updateWorkoutNotes = (workoutId: string, notes: string) => {
-    if (activeWorkout && activeWorkout.id === workoutId) {
-      setActiveWorkout({ ...activeWorkout, notes });
-    }
+    if (activeWorkout?.id === workoutId) setActiveWorkout({ ...activeWorkout, notes });
   };
 
   const deleteWorkout = async (workoutId: string) => {
     const updated = workouts.filter(w => w.id !== workoutId);
     setWorkouts(updated);
     await AsyncStorage.setItem(STORAGE_KEYS.WORKOUTS, JSON.stringify(updated));
-    try {
-      if (user) await firestoreService.deleteWorkout(user.id, workoutId);
-    } catch (err) {
-      console.log('Firestore workout delete failed:', err);
-    }
+    try { await dbService.deleteWorkout(workoutId); } catch (err) { console.log('Supabase delete workout failed:', err); }
   };
 
   // ========================================
   // Exercises
   // ========================================
 
-  const addCustomExercise = async (exerciseData: Omit<Exercise, 'id' | 'isCustom'>): Promise<Exercise> => {
-    const exercise: Exercise = { ...exerciseData, id: uuidv4(), isCustom: true };
-    const customExercises = exercises.filter(e => e.isCustom);
-    const updatedCustom = [...customExercises, exercise];
-    setExercises([...DEFAULT_EXERCISES, ...updatedCustom]);
-    await AsyncStorage.setItem(STORAGE_KEYS.EXERCISES, JSON.stringify(updatedCustom));
+  const addCustomExercise = async (data: Omit<Exercise, 'id' | 'isCustom'>): Promise<Exercise> => {
+    const exercise: Exercise = { ...data, id: uuidv4(), isCustom: true };
+    const custom = exercises.filter(e => e.isCustom);
+    setExercises([...DEFAULT_EXERCISES, ...custom, exercise]);
+    await AsyncStorage.setItem(STORAGE_KEYS.EXERCISES, JSON.stringify([...custom, exercise]));
     try {
-      if (user) await firestoreService.saveCustomExercise(user.id, exercise);
-    } catch (err) {
-      console.log('Firestore exercise save failed:', err);
-    }
+      if (user) await dbService.saveCustomExercise({
+        id: exercise.id, user_id: user.id, name: exercise.name,
+        muscle_group: exercise.muscleGroup, category: exercise.category, description: exercise.description,
+      });
+    } catch (err) { console.log('Supabase exercise save failed:', err); }
     return exercise;
   };
 
@@ -719,32 +647,18 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
   // ========================================
 
   const addBodyWeight = async (weight: number, notes?: string) => {
-    const entry: BodyWeight = {
-      id: uuidv4(),
-      userId: user?.id || '',
-      weight,
-      date: new Date().toISOString(),
-      notes,
-    };
+    const entry: BodyWeight = { id: uuidv4(), userId: user?.id || '', weight, date: new Date().toISOString(), notes };
     const updated = [entry, ...bodyWeights];
     setBodyWeights(updated);
     await AsyncStorage.setItem(STORAGE_KEYS.BODY_WEIGHTS, JSON.stringify(updated));
-
-    // Update user profile weight
     if (user) {
-      const updatedUser = {
-        ...user,
-        profile: { ...user.profile, weight },
-        updatedAt: new Date().toISOString(),
-      };
+      const updatedUser = { ...user, profile: { ...user.profile, weight }, updatedAt: new Date().toISOString() };
       setUser(updatedUser);
       await AsyncStorage.setItem(STORAGE_KEYS.USER, JSON.stringify(updatedUser));
       try {
-        await firestoreService.saveBodyWeight(user.id, entry);
-        await firestoreService.updateUserProfile(user.id, { 'profile.weight': weight });
-      } catch (err) {
-        console.log('Firestore body weight save failed:', err);
-      }
+        await dbService.saveBodyWeight({ id: entry.id, user_id: user.id, weight, date: entry.date, notes });
+        await dbService.upsertProfile({ id: user.id, weight });
+      } catch (err) { console.log('Supabase body weight save failed:', err); }
     }
   };
 
@@ -752,11 +666,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     const updated = bodyWeights.filter(bw => bw.id !== id);
     setBodyWeights(updated);
     await AsyncStorage.setItem(STORAGE_KEYS.BODY_WEIGHTS, JSON.stringify(updated));
-    try {
-      if (user) await firestoreService.deleteBodyWeight(user.id, id);
-    } catch (err) {
-      console.log('Firestore body weight delete failed:', err);
-    }
+    try { await dbService.deleteBodyWeight(id); } catch (err) { console.log('Supabase delete body weight failed:', err); }
   };
 
   // ========================================
@@ -764,31 +674,23 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
   // ========================================
 
   const addMeasurement = async (measurement: Omit<BodyMeasurement, 'id' | 'userId' | 'date'>) => {
-    const entry: BodyMeasurement = {
-      ...measurement,
-      id: uuidv4(),
-      userId: user?.id || '',
-      date: new Date().toISOString(),
-    };
+    const entry: BodyMeasurement = { ...measurement, id: uuidv4(), userId: user?.id || '', date: new Date().toISOString() };
     const updated = [entry, ...measurements];
     setMeasurements(updated);
     await AsyncStorage.setItem(STORAGE_KEYS.MEASUREMENTS, JSON.stringify(updated));
     try {
-      if (user) await firestoreService.saveMeasurement(user.id, entry);
-    } catch (err) {
-      console.log('Firestore measurement save failed:', err);
-    }
+      if (user) await dbService.saveMeasurement({
+        id: entry.id, user_id: user.id, date: entry.date,
+        chest: entry.chest, arms: entry.arms, waist: entry.waist, legs: entry.legs, notes: entry.notes,
+      });
+    } catch (err) { console.log('Supabase measurement save failed:', err); }
   };
 
   const deleteMeasurement = async (id: string) => {
     const updated = measurements.filter(m => m.id !== id);
     setMeasurements(updated);
     await AsyncStorage.setItem(STORAGE_KEYS.MEASUREMENTS, JSON.stringify(updated));
-    try {
-      if (user) await firestoreService.deleteMeasurement(user.id, id);
-    } catch (err) {
-      console.log('Firestore measurement delete failed:', err);
-    }
+    try { await dbService.deleteMeasurement(id); } catch (err) { console.log('Supabase delete measurement failed:', err); }
   };
 
   // ========================================
@@ -798,23 +700,9 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
   const addProgressPhoto = async (photo: Omit<ProgressPhoto, 'id' | 'userId' | 'date'>) => {
     const photoId = uuidv4();
     let cloudUri = photo.uri;
-
-    // Upload to Firebase Storage
-    try {
-      if (user) {
-        cloudUri = await storageService.uploadProgressPhoto(user.id, photo.uri, photoId);
-      }
-    } catch (err) {
-      console.log('Photo upload to Firebase Storage failed, keeping local URI:', err);
-    }
-
-    const entry: ProgressPhoto = {
-      ...photo,
-      id: photoId,
-      uri: cloudUri,
-      userId: user?.id || '',
-      date: new Date().toISOString(),
-    };
+    try { if (user) cloudUri = await storageService.uploadProgressPhoto(user.id, photo.uri, photoId); }
+    catch (err) { console.log('Photo upload failed, keeping local URI:', err); }
+    const entry: ProgressPhoto = { ...photo, id: photoId, uri: cloudUri, userId: user?.id || '', date: new Date().toISOString() };
     const updated = [entry, ...progressPhotos];
     setProgressPhotos(updated);
     await AsyncStorage.setItem(STORAGE_KEYS.PHOTOS, JSON.stringify(updated));
@@ -824,11 +712,7 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     const updated = progressPhotos.filter(p => p.id !== id);
     setProgressPhotos(updated);
     await AsyncStorage.setItem(STORAGE_KEYS.PHOTOS, JSON.stringify(updated));
-    try {
-      if (user) await storageService.deleteProgressPhoto(user.id, id);
-    } catch (err) {
-      console.log('Firestore photo delete failed:', err);
-    }
+    try { if (user) await storageService.deleteProgressPhoto(user.id, id); } catch (err) { console.log('Photo delete failed:', err); }
   };
 
   // ========================================
@@ -837,52 +721,34 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
 
   const checkPersonalRecords = async (workout: Workout) => {
     const newRecords: PersonalRecord[] = [];
-
     for (const exercise of workout.exercises) {
       for (const set of exercise.sets) {
         if (set.isCompleted && set.weight && set.reps) {
-          const existingRecord = personalRecords.find(
-            r => r.exerciseId === exercise.exerciseId
-          );
+          const existing = personalRecords.find(r => r.exerciseId === exercise.exerciseId);
           const oneRepMax = set.weight * (1 + set.reps / 30);
-
-          if (!existingRecord || (existingRecord.oneRepMax && oneRepMax > existingRecord.oneRepMax)) {
-            const record: PersonalRecord = {
-              id: uuidv4(),
-              userId: user?.id || '',
-              exerciseId: exercise.exerciseId,
-              exerciseName: exercise.exerciseName,
-              weight: set.weight,
-              reps: set.reps,
-              date: workout.date,
-              oneRepMax,
-            };
-            newRecords.push(record);
+          if (!existing || (existing.oneRepMax && oneRepMax > existing.oneRepMax)) {
+            newRecords.push({
+              id: uuidv4(), userId: user?.id || '', exerciseId: exercise.exerciseId,
+              exerciseName: exercise.exerciseName, weight: set.weight, reps: set.reps,
+              date: workout.date, oneRepMax,
+            });
           }
         }
       }
     }
-
     if (newRecords.length > 0) {
-      const updatedRecords = [
-        ...personalRecords.filter(
-          r => !newRecords.some(nr => nr.exerciseId === r.exerciseId)
-        ),
-        ...newRecords,
-      ];
+      const updatedRecords = [...personalRecords.filter(r => !newRecords.some(nr => nr.exerciseId === r.exerciseId)), ...newRecords];
       setPersonalRecords(updatedRecords);
       await AsyncStorage.setItem(STORAGE_KEYS.RECORDS, JSON.stringify(updatedRecords));
-
-      // Save each new record to Firestore
       try {
-        if (user) {
-          for (const record of newRecords) {
-            await firestoreService.savePersonalRecord(user.id, record);
-          }
+        if (user) for (const r of newRecords) {
+          await dbService.savePersonalRecord({
+            id: r.id, user_id: user.id, exercise_id: r.exerciseId,
+            exercise_name: r.exerciseName, weight: r.weight, reps: r.reps,
+            date: r.date, one_rep_max: r.oneRepMax,
+          });
         }
-      } catch (err) {
-        console.log('Firestore PR save failed:', err);
-      }
+      } catch (err) { console.log('Supabase PR save failed:', err); }
     }
   };
 
@@ -891,43 +757,37 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
   // ========================================
 
   const addGoal = async (goalData: Omit<Goal, 'id' | 'userId' | 'createdAt' | 'isCompleted'>) => {
-    const goal: Goal = {
-      ...goalData,
-      id: uuidv4(),
-      userId: user?.id || '',
-      createdAt: new Date().toISOString(),
-      isCompleted: false,
-    };
+    const goal: Goal = { ...goalData, id: uuidv4(), userId: user?.id || '', createdAt: new Date().toISOString(), isCompleted: false };
     const updated = [goal, ...goals];
     setGoals(updated);
     await AsyncStorage.setItem(STORAGE_KEYS.GOALS, JSON.stringify(updated));
     try {
-      if (user) await firestoreService.saveGoal(user.id, goal);
-    } catch (err) {
-      console.log('Firestore goal save failed:', err);
-    }
+      if (user) await dbService.saveGoal({
+        id: goal.id, user_id: user.id, type: goal.type, title: goal.title,
+        description: goal.description, target_value: goal.targetValue,
+        current_value: goal.currentValue, unit: goal.unit, deadline: goal.deadline,
+        is_completed: false,
+      });
+    } catch (err) { console.log('Supabase goal save failed:', err); }
   };
 
   const updateGoalFn = async (id: string, updates: Partial<Goal>) => {
-    const updated = goals.map(g => (g.id === id ? { ...g, ...updates } : g));
+    const updated = goals.map(g => g.id === id ? { ...g, ...updates } : g);
     setGoals(updated);
     await AsyncStorage.setItem(STORAGE_KEYS.GOALS, JSON.stringify(updated));
     try {
-      if (user) await firestoreService.updateGoal(user.id, id, updates);
-    } catch (err) {
-      console.log('Firestore goal update failed:', err);
-    }
+      const dbUpdates: Record<string, any> = {};
+      if (updates.isCompleted !== undefined) dbUpdates.is_completed = updates.isCompleted;
+      if (updates.currentValue !== undefined) dbUpdates.current_value = updates.currentValue;
+      if (updates.title !== undefined) dbUpdates.title = updates.title;
+      if (Object.keys(dbUpdates).length) await dbService.updateGoal(id, dbUpdates);
+    } catch (err) { console.log('Supabase goal update failed:', err); }
   };
 
   const deleteGoal = async (id: string) => {
-    const updated = goals.filter(g => g.id !== id);
-    setGoals(updated);
-    await AsyncStorage.setItem(STORAGE_KEYS.GOALS, JSON.stringify(updated));
-    try {
-      if (user) await firestoreService.deleteGoal(user.id, id);
-    } catch (err) {
-      console.log('Firestore goal delete failed:', err);
-    }
+    setGoals(goals.filter(g => g.id !== id));
+    await AsyncStorage.setItem(STORAGE_KEYS.GOALS, JSON.stringify(goals.filter(g => g.id !== id)));
+    try { await dbService.deleteGoal(id); } catch (err) { console.log('Supabase goal delete failed:', err); }
   };
 
   // ========================================
@@ -935,47 +795,32 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
   // ========================================
 
   const saveTemplateFn = async (templateData: Omit<WorkoutTemplate, 'id' | 'userId' | 'createdAt' | 'timesUsed'>) => {
-    const template: WorkoutTemplate = {
-      ...templateData,
-      id: uuidv4(),
-      userId: user?.id || '',
-      createdAt: new Date().toISOString(),
-      timesUsed: 0,
-    };
+    const template: WorkoutTemplate = { ...templateData, id: uuidv4(), userId: user?.id || '', createdAt: new Date().toISOString(), timesUsed: 0 };
     const updated = [template, ...templates];
     setTemplates(updated);
     await AsyncStorage.setItem(STORAGE_KEYS.TEMPLATES, JSON.stringify(updated));
     try {
-      if (user) await firestoreService.saveTemplate(user.id, template);
-    } catch (err) {
-      console.log('Firestore template save failed:', err);
-    }
+      if (user) await dbService.saveTemplate({
+        id: template.id, user_id: user.id, name: template.name,
+        exercises: template.exercises, times_used: 0,
+      });
+    } catch (err) { console.log('Supabase template save failed:', err); }
   };
 
   const deleteTemplate = async (id: string) => {
-    const updated = templates.filter(t => t.id !== id);
-    setTemplates(updated);
-    await AsyncStorage.setItem(STORAGE_KEYS.TEMPLATES, JSON.stringify(updated));
-    try {
-      if (user) await firestoreService.deleteTemplate(user.id, id);
-    } catch (err) {
-      console.log('Firestore template delete failed:', err);
-    }
+    setTemplates(templates.filter(t => t.id !== id));
+    await AsyncStorage.setItem(STORAGE_KEYS.TEMPLATES, JSON.stringify(templates.filter(t => t.id !== id)));
+    try { await dbService.deleteTemplate(id); } catch (err) { console.log('Supabase template delete failed:', err); }
   };
 
   // ========================================
-  // Notifications
+  // Notifications (local only)
   // ========================================
 
   const updateNotificationSettingsFn = async (settings: Partial<NotificationSettings>) => {
     const updated = { ...notificationSettings, ...settings };
     setNotificationSettings(updated);
     await AsyncStorage.setItem(STORAGE_KEYS.NOTIFICATIONS, JSON.stringify(updated));
-    try {
-      if (user) await firestoreService.saveNotificationSettings(user.id, updated);
-    } catch (err) {
-      console.log('Firestore notification settings save failed:', err);
-    }
   };
 
   // ========================================
@@ -984,11 +829,10 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
 
   const estimateCalories = (workout: Workout, durationSeconds: number): number => {
     const durationMinutes = durationSeconds / 60;
-    const baseBurnPerMinute = 5;
     const exerciseCount = workout.exercises.length || 1;
     const totalSets = workout.exercises.reduce((acc, ex) => acc + ex.sets.length, 0);
     const intensityMultiplier = Math.min(1.5, 1 + (totalSets / exerciseCount) * 0.05);
-    return Math.round(durationMinutes * baseBurnPerMinute * intensityMultiplier);
+    return Math.round(durationMinutes * 5 * intensityMultiplier);
   };
 
   // ========================================
@@ -996,52 +840,21 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
   // ========================================
 
   const value: AppContextType = {
-    isAuthenticated,
-    hasOnboarded,
-    user,
-    firebaseUser,
-    signIn,
-    signUp,
-    signInWithGoogle,
-    signInWithApple,
-    signOut,
-    sendPasswordReset,
-    completeOnboarding,
-    updateProfile: updateProfileFn,
-    updateSubscription,
-    workouts,
-    activeWorkout,
-    startWorkout,
-    finishWorkout,
-    cancelWorkout,
-    addExerciseToWorkout,
-    removeExerciseFromWorkout,
-    addSetToExercise,
-    removeSetFromExercise,
-    updateSet,
-    updateWorkoutNotes,
-    deleteWorkout,
-    exercises,
-    addCustomExercise,
-    bodyWeights,
-    addBodyWeight,
-    deleteBodyWeight,
-    measurements,
-    addMeasurement,
-    deleteMeasurement,
-    progressPhotos,
-    addProgressPhoto,
-    deleteProgressPhoto,
+    isAuthenticated, hasOnboarded, user, supabaseUser,
+    signIn, signUp, signInWithGoogle, signInWithApple, handleOAuthCallback,
+    signOut, sendPasswordReset, completeOnboarding,
+    updateProfile: updateProfileFn, updateSubscription,
+    workouts, activeWorkout, startWorkout, finishWorkout, cancelWorkout,
+    addExerciseToWorkout, removeExerciseFromWorkout,
+    addSetToExercise, removeSetFromExercise, updateSet, updateWorkoutNotes, deleteWorkout,
+    exercises, addCustomExercise,
+    bodyWeights, addBodyWeight, deleteBodyWeight,
+    measurements, addMeasurement, deleteMeasurement,
+    progressPhotos, addProgressPhoto, deleteProgressPhoto,
     personalRecords,
-    goals,
-    addGoal,
-    updateGoal: updateGoalFn,
-    deleteGoal,
-    templates,
-    saveTemplate: saveTemplateFn,
-    deleteTemplate,
-    notificationSettings,
-    updateNotificationSettings: updateNotificationSettingsFn,
+    goals, addGoal, updateGoal: updateGoalFn, deleteGoal,
+    templates, saveTemplate: saveTemplateFn, deleteTemplate,
+    notificationSettings, updateNotificationSettings: updateNotificationSettingsFn,
     isLoading,
   };
 

@@ -1,8 +1,8 @@
 // ==========================================
-// GymTrack Pro - Login Screen
+// GymTrack Pro - Login Screen (Supabase)
 // ==========================================
 
-import React, { useState, useEffect } from 'react';
+import React, { useState } from 'react';
 import {
   View,
   Text,
@@ -16,7 +16,6 @@ import {
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { Ionicons } from '@expo/vector-icons';
-import * as Google from 'expo-auth-session/providers/google';
 import * as WebBrowser from 'expo-web-browser';
 import { useTheme } from '../../contexts/ThemeContext';
 import { useApp } from '../../contexts/AppContext';
@@ -24,51 +23,14 @@ import { Button } from '../../components/Button';
 import { Input } from '../../components/Input';
 import { FONT_SIZE, FONT_WEIGHT, SPACING, BORDER_RADIUS } from '../../constants/theme';
 
-// Required for expo-auth-session to close the browser on redirect
-WebBrowser.maybeCompleteAuthSession();
-
-// Firebase Google OAuth client IDs
-const IOS_CLIENT_ID = '294195477862-4hlduj9p5ap9n0kulqgl8j0olsfq2t97.apps.googleusercontent.com';
-
 export const LoginScreen: React.FC<{ navigation: any }> = ({ navigation }) => {
   const { colors } = useTheme();
-  const { signIn, signInWithGoogle, signInWithApple, sendPasswordReset } = useApp();
+  const { signIn, signInWithGoogle, signInWithApple, handleOAuthCallback, sendPasswordReset } = useApp();
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [loading, setLoading] = useState(false);
   const [googleLoading, setGoogleLoading] = useState(false);
   const [errors, setErrors] = useState<{ email?: string; password?: string }>({});
-
-  // Google Auth Session
-  const [request, response, promptAsync] = Google.useIdTokenAuthRequest({
-    iosClientId: IOS_CLIENT_ID,
-  });
-
-  // Handle Google sign-in response
-  useEffect(() => {
-    if (response?.type === 'success') {
-      const { id_token } = response.params;
-      handleGoogleToken(id_token);
-    } else if (response?.type === 'error') {
-      setGoogleLoading(false);
-      Alert.alert('Google Sign-In Failed', response.error?.message || 'Something went wrong.');
-    } else if (response?.type === 'dismiss') {
-      setGoogleLoading(false);
-    }
-  }, [response]);
-
-  const handleGoogleToken = async (idToken: string) => {
-    try {
-      const success = await signInWithGoogle(idToken);
-      if (!success) {
-        Alert.alert('Google Sign-In Failed', 'Could not sign in with Google. Please try again.');
-      }
-    } catch (error: any) {
-      Alert.alert('Google Sign-In Failed', error?.message || 'Something went wrong.');
-    } finally {
-      setGoogleLoading(false);
-    }
-  };
 
   const validate = (): boolean => {
     const newErrors: typeof errors = {};
@@ -92,15 +54,7 @@ export const LoginScreen: React.FC<{ navigation: any }> = ({ navigation }) => {
         );
       }
     } catch (error: any) {
-      const message =
-        error?.code === 'auth/user-not-found'
-          ? 'No account found with this email.'
-          : error?.code === 'auth/wrong-password'
-          ? 'Incorrect password.'
-          : error?.code === 'auth/too-many-requests'
-          ? 'Too many attempts. Please try again later.'
-          : 'Something went wrong. Please try again.';
-      Alert.alert('Login Failed', message);
+      Alert.alert('Login Failed', error?.message || 'Something went wrong. Please try again.');
     } finally {
       setLoading(false);
     }
@@ -134,10 +88,23 @@ export const LoginScreen: React.FC<{ navigation: any }> = ({ navigation }) => {
   const handleGoogleLogin = async () => {
     setGoogleLoading(true);
     try {
-      await promptAsync();
-    } catch (error) {
+      const result = await signInWithGoogle();
+      if (result?.url) {
+        // Open the Supabase Google OAuth URL in an in-app browser
+        const browserResult = await WebBrowser.openAuthSessionAsync(
+          result.url,
+          'gymtrackpro://auth/callback'
+        );
+        if (browserResult.type === 'success' && browserResult.url) {
+          await handleOAuthCallback(browserResult.url);
+        }
+      } else {
+        Alert.alert('Google Sign-In', 'Could not initiate Google Sign-In. Please try again.');
+      }
+    } catch (error: any) {
+      Alert.alert('Google Sign-In Failed', error?.message || 'Something went wrong.');
+    } finally {
       setGoogleLoading(false);
-      Alert.alert('Google Sign-In', 'Could not open Google Sign-In. Please try again.');
     }
   };
 
@@ -146,10 +113,20 @@ export const LoginScreen: React.FC<{ navigation: any }> = ({ navigation }) => {
       Alert.alert('Apple Sign-In', 'Apple Sign-In is only available on iOS devices.');
       return;
     }
-    Alert.alert(
-      'Apple Sign-In',
-      'Apple Sign-In requires a native build with EAS. Use email/password or Google for now.'
-    );
+    try {
+      const result = await signInWithApple();
+      if (result?.url) {
+        const browserResult = await WebBrowser.openAuthSessionAsync(
+          result.url,
+          'gymtrackpro://auth/callback'
+        );
+        if (browserResult.type === 'success' && browserResult.url) {
+          await handleOAuthCallback(browserResult.url);
+        }
+      }
+    } catch (error: any) {
+      Alert.alert('Apple Sign-In Failed', error?.message || 'Something went wrong.');
+    }
   };
 
   return (
@@ -233,7 +210,7 @@ export const LoginScreen: React.FC<{ navigation: any }> = ({ navigation }) => {
                 },
               ]}
               onPress={handleGoogleLogin}
-              disabled={loading || googleLoading || !request}
+              disabled={loading || googleLoading}
             >
               {googleLoading ? (
                 <ActivityIndicator size="small" color="#DB4437" />
@@ -274,93 +251,34 @@ export const LoginScreen: React.FC<{ navigation: any }> = ({ navigation }) => {
 };
 
 const styles = StyleSheet.create({
-  container: {
-    flex: 1,
-  },
-  flex: {
-    flex: 1,
-  },
+  container: { flex: 1 },
+  flex: { flex: 1 },
   scrollContent: {
     flexGrow: 1,
     paddingHorizontal: SPACING.xxl,
     paddingTop: SPACING.huge,
     paddingBottom: SPACING.xxxl,
   },
-  header: {
-    alignItems: 'center',
-    marginBottom: SPACING.xxxl,
-  },
+  header: { alignItems: 'center', marginBottom: SPACING.xxxl },
   logoContainer: {
-    width: 80,
-    height: 80,
-    borderRadius: BORDER_RADIUS.xl,
-    alignItems: 'center',
-    justifyContent: 'center',
-    marginBottom: SPACING.lg,
+    width: 80, height: 80, borderRadius: BORDER_RADIUS.xl,
+    alignItems: 'center', justifyContent: 'center', marginBottom: SPACING.lg,
   },
-  title: {
-    fontSize: FONT_SIZE.hero,
-    fontWeight: FONT_WEIGHT.heavy,
-    marginBottom: SPACING.xs,
-  },
-  subtitle: {
-    fontSize: FONT_SIZE.lg,
-    textAlign: 'center',
-  },
-  form: {
-    marginBottom: SPACING.xxl,
-  },
-  forgotPassword: {
-    alignSelf: 'flex-end',
-    marginBottom: SPACING.sm,
-  },
-  forgotPasswordText: {
-    fontSize: FONT_SIZE.sm,
-    fontWeight: FONT_WEIGHT.semibold,
-  },
-  dividerContainer: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    marginBottom: SPACING.xxl,
-  },
-  dividerLine: {
-    flex: 1,
-    height: 1,
-  },
-  dividerText: {
-    marginHorizontal: SPACING.lg,
-    fontSize: FONT_SIZE.sm,
-  },
-  socialContainer: {
-    flexDirection: 'row',
-    justifyContent: 'center',
-    gap: SPACING.md,
-    marginBottom: SPACING.xxxl,
-  },
+  title: { fontSize: FONT_SIZE.hero, fontWeight: FONT_WEIGHT.heavy, marginBottom: SPACING.xs },
+  subtitle: { fontSize: FONT_SIZE.lg, textAlign: 'center' },
+  form: { marginBottom: SPACING.xxl },
+  forgotPassword: { alignSelf: 'flex-end', marginBottom: SPACING.sm },
+  forgotPasswordText: { fontSize: FONT_SIZE.sm, fontWeight: FONT_WEIGHT.semibold },
+  dividerContainer: { flexDirection: 'row', alignItems: 'center', marginBottom: SPACING.xxl },
+  dividerLine: { flex: 1, height: 1 },
+  dividerText: { marginHorizontal: SPACING.lg, fontSize: FONT_SIZE.sm },
+  socialContainer: { flexDirection: 'row', justifyContent: 'center', gap: SPACING.md, marginBottom: SPACING.xxxl },
   socialButton: {
-    flex: 1,
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'center',
-    paddingVertical: SPACING.md,
-    borderRadius: BORDER_RADIUS.md,
-    borderWidth: 1,
-    gap: SPACING.sm,
+    flex: 1, flexDirection: 'row', alignItems: 'center', justifyContent: 'center',
+    paddingVertical: SPACING.md, borderRadius: BORDER_RADIUS.md, borderWidth: 1, gap: SPACING.sm,
   },
-  socialText: {
-    fontSize: FONT_SIZE.md,
-    fontWeight: FONT_WEIGHT.semibold,
-  },
-  signUpContainer: {
-    flexDirection: 'row',
-    justifyContent: 'center',
-    alignItems: 'center',
-  },
-  signUpText: {
-    fontSize: FONT_SIZE.md,
-  },
-  signUpLink: {
-    fontSize: FONT_SIZE.md,
-    fontWeight: FONT_WEIGHT.bold,
-  },
+  socialText: { fontSize: FONT_SIZE.md, fontWeight: FONT_WEIGHT.semibold },
+  signUpContainer: { flexDirection: 'row', justifyContent: 'center', alignItems: 'center' },
+  signUpText: { fontSize: FONT_SIZE.md },
+  signUpLink: { fontSize: FONT_SIZE.md, fontWeight: FONT_WEIGHT.bold },
 });

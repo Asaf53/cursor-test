@@ -6,8 +6,9 @@ A modern, cross-platform gym tracking mobile application built with React Native
 
 ### Authentication
 - Email/password sign in & sign up
-- Google login (Firebase integration ready)
-- Apple login (Firebase integration ready)
+- Google OAuth login (via Supabase)
+- Apple OAuth login (via Supabase)
+- Password reset via email
 - Onboarding flow for new users
 
 ### Workout Tracking
@@ -70,11 +71,11 @@ A modern, cross-platform gym tracking mobile application built with React Native
 | Language | TypeScript |
 | Navigation | React Navigation (bottom tabs + native stack) |
 | State Management | React Context API |
-| Local Storage | AsyncStorage |
+| Local Storage | AsyncStorage + expo-secure-store |
+| Backend | **Supabase** (Auth, PostgreSQL, Storage) |
 | Notifications | Expo Notifications |
 | Image Picker | Expo Image Picker |
 | Icons | @expo/vector-icons (Ionicons) |
-| Backend | Firebase (Auth, Firestore, Storage) - **integrated** |
 
 ## Project Structure
 
@@ -84,6 +85,7 @@ GymTrackPro/
 ├── app.json                         # Expo configuration
 ├── package.json                     # Dependencies
 ├── tsconfig.json                    # TypeScript configuration
+├── supabase-schema.sql              # Database schema + RLS policies
 ├── assets/                          # App icons and splash screens
 └── src/
     ├── components/                  # Reusable UI components
@@ -98,14 +100,15 @@ GymTrackPro/
     │   ├── exercises.ts             # Exercise library (60+ exercises)
     │   └── theme.ts                 # Theme colors, spacing, typography
     ├── contexts/
-    │   ├── AppContext.tsx            # Global app state & data management
+    │   ├── AppContext.tsx            # Global app state (Supabase + AsyncStorage)
     │   └── ThemeContext.tsx          # Dark/light theme management
-    ├── hooks/                       # Custom React hooks
+    ├── hooks/
+    │   └── useWorkoutAnalytics.ts   # Workout analytics hook
     ├── navigation/
     │   └── AppNavigator.tsx         # Navigation structure
     ├── screens/
     │   ├── Auth/
-    │   │   ├── LoginScreen.tsx      # Sign in screen
+    │   │   ├── LoginScreen.tsx      # Sign in + Google/Apple OAuth
     │   │   ├── SignUpScreen.tsx      # Registration screen
     │   │   └── OnboardingScreen.tsx  # New user onboarding
     │   ├── Dashboard/
@@ -114,11 +117,11 @@ GymTrackPro/
     │   │   ├── WorkoutsScreen.tsx    # Workout list & templates
     │   │   └── ActiveWorkoutScreen.tsx # Active workout tracking
     │   ├── Progress/
-    │   │   └── ProgressScreen.tsx    # Progress tracking (weight, measurements, photos, strength)
+    │   │   └── ProgressScreen.tsx    # Progress tracking
     │   └── Profile/
     │       └── ProfileScreen.tsx     # User profile, goals, settings
     ├── services/
-    │   ├── firebase.ts              # Firebase init, Auth, Firestore & Storage services
+    │   ├── supabase.ts              # Supabase client, Auth, DB & Storage services
     │   └── notifications.ts         # Notification service
     ├── types/
     │   └── index.ts                 # TypeScript type definitions
@@ -134,6 +137,7 @@ GymTrackPro/
 - npm or yarn
 - Expo CLI (`npm install -g expo-cli`)
 - Expo Go app on your phone (for testing)
+- A Supabase project ([supabase.com](https://supabase.com))
 
 ### Installation
 
@@ -162,43 +166,67 @@ npx expo run:android
 npx expo start
 ```
 
-## Firebase Integration
+## Supabase Setup
 
-Firebase is fully integrated using the Firebase JS SDK (v11+). The project is connected to the
-`gymtrackpro-dc0a4` Firebase project.
+### 1. Create Project
 
-### What's Configured
+Go to [supabase.com/dashboard](https://supabase.com/dashboard) and create a new project.
 
-- **Authentication** -- Email/password, Google Sign-In (credential-based), Apple Sign-In (credential-based)
-- **Firestore** -- All user data (workouts, body weights, measurements, goals, templates, personal records, custom exercises, notification settings) synced per-user under `users/{uid}/...`
-- **Firebase Storage** -- Progress photos uploaded to `users/{uid}/progress-photos/`
-- **Offline-first** -- AsyncStorage is used as a local cache; Firestore syncs in the background. The app works fully offline.
+### 2. Run Database Schema
 
-### Enabling Google & Apple Sign-In on Device
+Open the **SQL Editor** in your Supabase dashboard and paste the contents of `supabase-schema.sql`. This creates all tables, indexes, RLS policies, and the auto-profile trigger.
 
-Google and Apple sign-in require native modules that don't run in Expo Go. To enable them:
+### 3. Add Your Credentials
 
-1. Build with EAS: `eas build --platform ios`
-2. For Google Sign-In, install `expo-auth-session` or `@react-native-google-signin/google-signin`
-3. For Apple Sign-In, install `expo-apple-authentication`
-4. See `LoginScreen.tsx` for integration guidance comments
+Open `src/services/supabase.ts` and replace the placeholder values:
 
-### Adding Android Support
+```typescript
+const SUPABASE_URL = 'https://YOUR_PROJECT_ID.supabase.co';
+const SUPABASE_ANON_KEY = 'YOUR_SUPABASE_ANON_KEY';
+```
 
-1. Register an Android app in the Firebase console with package name `gymtrackpro`
-2. Download `google-services.json` and place it in the project root
-3. Add to `app.json`:
-   ```json
-   "android": { "googleServicesFile": "./google-services.json" }
-   ```
+Find these in **Settings > API** in your Supabase dashboard.
 
-### Files
+### 4. Enable Auth Providers
 
-| File | Purpose |
-|------|---------|
-| `GoogleService-Info.plist` | iOS Firebase config |
-| `src/services/firebase.ts` | Firebase init + Auth, Firestore, Storage services |
-| `src/contexts/AppContext.tsx` | Data layer with Firebase + AsyncStorage |
+In **Authentication > Providers**:
+
+- **Email**: Enabled by default
+- **Google**: Enable and add your Google OAuth client ID & secret
+- **Apple**: Enable and configure (iOS only)
+
+### 5. Set up Storage
+
+In **Storage**, create a bucket named `progress-photos` and set it to **public**. Then add RLS policies as described in `supabase-schema.sql`.
+
+### 6. Configure OAuth Redirect
+
+In **Authentication > URL Configuration**, add `gymtrackpro://auth/callback` to **Redirect URLs**.
+
+## Architecture
+
+### Offline-First with Supabase Sync
+
+- **AsyncStorage** is the local cache -- loaded first for instant UI
+- **Supabase** syncs in the background on login
+- Every write goes to local cache first, then Supabase (graceful offline fallback)
+- Auth state is driven by `supabase.auth.onAuthStateChange`
+- Auth tokens are stored encrypted using `expo-secure-store` + AES
+
+### Database Structure (PostgreSQL)
+
+| Table | Description |
+|-------|-------------|
+| `profiles` | User profile (auto-created on sign-up via trigger) |
+| `workouts` | Workout sessions with exercises stored as JSONB |
+| `body_weights` | Body weight log entries |
+| `measurements` | Body measurements (chest, arms, waist, legs) |
+| `personal_records` | Exercise personal records with estimated 1RM |
+| `goals` | Fitness goals |
+| `workout_templates` | Saved workout templates |
+| `custom_exercises` | User-created exercises |
+
+All tables have **Row Level Security** (RLS) so users can only access their own data.
 
 ## Future Roadmap
 
@@ -208,7 +236,6 @@ Google and Apple sign-in require native modules that don't run in Expo Go. To en
 - Trainer-client mode
 - Social features
 - Exercise video demonstrations
-- Advanced charts and reporting
 
 ## Target Audience
 

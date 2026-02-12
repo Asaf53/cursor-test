@@ -16,17 +16,9 @@
     "ios": {
       "supportsTablet": true,
       "bundleIdentifier": "gymtrackpro",
-      "googleServicesFile": "./GoogleService-Info.plist",
       "infoPlist": {
         "NSCameraUsageDescription": "GymTrack Pro needs access to your camera to take progress photos.",
-        "NSPhotoLibraryUsageDescription": "GymTrack Pro needs access to your photo library to upload progress photos.",
-        "CFBundleURLTypes": [
-          {
-            "CFBundleURLSchemes": [
-              "com.googleusercontent.apps.294195477862-4hlduj9p5ap9n0kulqgl8j0olsfq2t97"
-            ]
-          }
-        ]
+        "NSPhotoLibraryUsageDescription": "GymTrack Pro needs access to your photo library to upload progress photos."
       }
     },
     "android": {
@@ -66,11 +58,6 @@
         }
       ],
       "expo-web-browser"
-    ],
-    "extra": {
-      "eas": {
-        "projectId": "gymtrack-pro-app"
-      }
-    }
+    ]
   }
 }
