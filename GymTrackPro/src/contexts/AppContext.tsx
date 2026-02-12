@@ -1,10 +1,12 @@
 // ==========================================
 // GymTrack Pro - App Data Context
+// Firebase-integrated with AsyncStorage cache
 // ==========================================
 
-import React, { createContext, useContext, useState, useEffect, ReactNode, useCallback } from 'react';
+import React, { createContext, useContext, useState, useEffect, ReactNode } from 'react';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { v4 as uuidv4 } from 'uuid';
+import { User as FirebaseUser } from 'firebase/auth';
 import {
   User,
   UserProfile,
@@ -24,8 +26,9 @@ import {
   SubscriptionPlan,
 } from '../types';
 import { DEFAULT_EXERCISES } from '../constants/exercises';
+import { authService, firestoreService, storageService } from '../services/firebase';
 
-// Storage Keys
+// Storage Keys (used as local cache)
 const STORAGE_KEYS = {
   USER: '@gymtrack_user',
   WORKOUTS: '@gymtrack_workouts',
@@ -37,7 +40,6 @@ const STORAGE_KEYS = {
   GOALS: '@gymtrack_goals',
   TEMPLATES: '@gymtrack_templates',
   NOTIFICATIONS: '@gymtrack_notifications',
-  IS_AUTHENTICATED: '@gymtrack_is_authenticated',
   HAS_ONBOARDED: '@gymtrack_has_onboarded',
 };
 
@@ -46,9 +48,13 @@ interface AppContextType {
   isAuthenticated: boolean;
   hasOnboarded: boolean;
   user: User | null;
+  firebaseUser: FirebaseUser | null;
   signIn: (email: string, password: string) => Promise<boolean>;
   signUp: (email: string, password: string, name: string) => Promise<boolean>;
+  signInWithGoogle: (idToken: string) => Promise<boolean>;
+  signInWithApple: (identityToken: string, nonce: string) => Promise<boolean>;
   signOut: () => Promise<void>;
+  sendPasswordReset: (email: string) => Promise<boolean>;
   completeOnboarding: (profile: Partial<UserProfile>) => Promise<void>;
 
   // User
@@ -122,11 +128,33 @@ const AppContext = createContext<AppContextType>({} as AppContextType);
 
 export const useApp = () => useContext(AppContext);
 
+// ---- Helper: build our internal User from a Firebase user ----
+const buildUser = (fbUser: FirebaseUser, profile?: Partial<UserProfile>): User => ({
+  id: fbUser.uid,
+  email: fbUser.email || '',
+  displayName: fbUser.displayName || fbUser.email?.split('@')[0] || 'User',
+  photoURL: fbUser.photoURL || undefined,
+  createdAt: fbUser.metadata.creationTime || new Date().toISOString(),
+  updatedAt: new Date().toISOString(),
+  profile: {
+    name: fbUser.displayName || fbUser.email?.split('@')[0] || 'User',
+    age: null,
+    height: null,
+    weight: null,
+    goal: 'muscle_gain',
+    experienceLevel: 'beginner',
+    units: 'metric',
+    ...profile,
+  },
+  subscription: 'free',
+});
+
 export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => {
   const [isLoading, setIsLoading] = useState(true);
   const [isAuthenticated, setIsAuthenticated] = useState(false);
   const [hasOnboarded, setHasOnboarded] = useState(false);
   const [user, setUser] = useState<User | null>(null);
+  const [firebaseUser, setFirebaseUser] = useState<FirebaseUser | null>(null);
   const [workouts, setWorkouts] = useState<Workout[]>([]);
   const [activeWorkout, setActiveWorkout] = useState<Workout | null>(null);
   const [exercises, setExercises] = useState<Exercise[]>(DEFAULT_EXERCISES);
@@ -138,17 +166,90 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
   const [templates, setTemplates] = useState<WorkoutTemplate[]>([]);
   const [notificationSettings, setNotificationSettings] = useState<NotificationSettings>(defaultNotificationSettings);
 
-  // Load all data on mount
+  // ========================================
+  // Firebase Auth State Listener
+  // ========================================
   useEffect(() => {
-    loadAllData();
+    const unsubscribe = authService.onAuthStateChanged(async (fbUser) => {
+      if (fbUser) {
+        setFirebaseUser(fbUser);
+        setIsAuthenticated(true);
+        await handleUserLogin(fbUser);
+      } else {
+        setFirebaseUser(null);
+        setIsAuthenticated(false);
+        setUser(null);
+      }
+      setIsLoading(false);
+    });
+    return unsubscribe;
   }, []);
 
-  const loadAllData = async () => {
+  /**
+   * Called when Firebase confirms a user is logged in.
+   * Loads their profile from Firestore (or local cache), then loads all data.
+   */
+  const handleUserLogin = async (fbUser: FirebaseUser) => {
+    try {
+      // 1. Load local cache first for instant UI
+      await loadLocalCache();
+
+      // 2. Try to get Firestore profile
+      let firestoreProfile: any = null;
+      try {
+        firestoreProfile = await firestoreService.getUserProfile(fbUser.uid);
+      } catch (err) {
+        console.log('Firestore profile fetch failed (offline?), using cache:', err);
+      }
+
+      if (firestoreProfile) {
+        const appUser: User = {
+          id: fbUser.uid,
+          email: fbUser.email || '',
+          displayName: firestoreProfile.displayName || fbUser.displayName || '',
+          photoURL: firestoreProfile.photoURL || fbUser.photoURL || undefined,
+          createdAt: firestoreProfile.createdAt?.toDate?.()?.toISOString?.() || fbUser.metadata.creationTime || '',
+          updatedAt: firestoreProfile.updatedAt?.toDate?.()?.toISOString?.() || '',
+          profile: firestoreProfile.profile || {
+            name: firestoreProfile.displayName || '',
+            age: null, height: null, weight: null,
+            goal: 'muscle_gain', experienceLevel: 'beginner', units: 'metric',
+          },
+          subscription: firestoreProfile.subscription || 'free',
+        };
+        setUser(appUser);
+        setHasOnboarded(firestoreProfile.hasOnboarded ?? false);
+        await AsyncStorage.setItem(STORAGE_KEYS.USER, JSON.stringify(appUser));
+        await AsyncStorage.setItem(STORAGE_KEYS.HAS_ONBOARDED, JSON.stringify(firestoreProfile.hasOnboarded ?? false));
+      } else {
+        // No Firestore profile yet -- use cached or build fresh
+        const cached = await AsyncStorage.getItem(STORAGE_KEYS.USER);
+        if (cached) {
+          setUser(JSON.parse(cached));
+        } else {
+          const newUser = buildUser(fbUser);
+          setUser(newUser);
+          await AsyncStorage.setItem(STORAGE_KEYS.USER, JSON.stringify(newUser));
+        }
+        const onboarded = await AsyncStorage.getItem(STORAGE_KEYS.HAS_ONBOARDED);
+        setHasOnboarded(onboarded ? JSON.parse(onboarded) : false);
+      }
+
+      // 3. Background-sync collections from Firestore
+      syncFromFirestore(fbUser.uid);
+    } catch (error) {
+      console.log('handleUserLogin error:', error);
+    }
+  };
+
+  /**
+   * Load everything from local AsyncStorage (fast, offline-first)
+   */
+  const loadLocalCache = async () => {
     try {
       const [
-        storedAuth,
-        storedOnboarded,
         storedUser,
+        storedOnboarded,
         storedWorkouts,
         storedExercises,
         storedBodyWeights,
@@ -159,9 +260,8 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         storedTemplates,
         storedNotifications,
       ] = await Promise.all([
-        AsyncStorage.getItem(STORAGE_KEYS.IS_AUTHENTICATED),
-        AsyncStorage.getItem(STORAGE_KEYS.HAS_ONBOARDED),
         AsyncStorage.getItem(STORAGE_KEYS.USER),
+        AsyncStorage.getItem(STORAGE_KEYS.HAS_ONBOARDED),
         AsyncStorage.getItem(STORAGE_KEYS.WORKOUTS),
         AsyncStorage.getItem(STORAGE_KEYS.EXERCISES),
         AsyncStorage.getItem(STORAGE_KEYS.BODY_WEIGHTS),
@@ -173,9 +273,8 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         AsyncStorage.getItem(STORAGE_KEYS.NOTIFICATIONS),
       ]);
 
-      if (storedAuth) setIsAuthenticated(JSON.parse(storedAuth));
-      if (storedOnboarded) setHasOnboarded(JSON.parse(storedOnboarded));
       if (storedUser) setUser(JSON.parse(storedUser));
+      if (storedOnboarded) setHasOnboarded(JSON.parse(storedOnboarded));
       if (storedWorkouts) setWorkouts(JSON.parse(storedWorkouts));
       if (storedExercises) {
         const custom = JSON.parse(storedExercises) as Exercise[];
@@ -189,91 +288,166 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       if (storedTemplates) setTemplates(JSON.parse(storedTemplates));
       if (storedNotifications) setNotificationSettings(JSON.parse(storedNotifications));
     } catch (error) {
-      console.log('Error loading data:', error);
-    } finally {
-      setIsLoading(false);
+      console.log('loadLocalCache error:', error);
     }
   };
 
-  // ---- Authentication ----
-
-  const signIn = async (email: string, _password: string): Promise<boolean> => {
+  /**
+   * Pull latest data from Firestore and merge into state + local cache.
+   * Runs in the background so the UI isn't blocked.
+   */
+  const syncFromFirestore = async (userId: string) => {
     try {
-      // In a production app, this would call Firebase Auth
-      const storedUser = await AsyncStorage.getItem(STORAGE_KEYS.USER);
-      if (storedUser) {
-        const parsedUser = JSON.parse(storedUser);
-        if (parsedUser.email === email) {
-          setUser(parsedUser);
-          setIsAuthenticated(true);
-          await AsyncStorage.setItem(STORAGE_KEYS.IS_AUTHENTICATED, JSON.stringify(true));
-          return true;
-        }
+      const [
+        fsWorkouts,
+        fsBodyWeights,
+        fsMeasurements,
+        fsRecords,
+        fsGoals,
+        fsTemplates,
+        fsExercises,
+        fsNotifications,
+      ] = await Promise.allSettled([
+        firestoreService.getWorkouts(userId),
+        firestoreService.getBodyWeights(userId),
+        firestoreService.getMeasurements(userId),
+        firestoreService.getPersonalRecords(userId),
+        firestoreService.getGoals(userId),
+        firestoreService.getTemplates(userId),
+        firestoreService.getCustomExercises(userId),
+        firestoreService.getNotificationSettings(userId),
+      ]);
+
+      if (fsWorkouts.status === 'fulfilled' && fsWorkouts.value.length > 0) {
+        setWorkouts(fsWorkouts.value as Workout[]);
+        await AsyncStorage.setItem(STORAGE_KEYS.WORKOUTS, JSON.stringify(fsWorkouts.value));
       }
-      // Create user if not exists (demo mode)
-      const newUser: User = {
-        id: uuidv4(),
-        email,
-        displayName: email.split('@')[0],
-        createdAt: new Date().toISOString(),
-        updatedAt: new Date().toISOString(),
-        profile: {
-          name: email.split('@')[0],
-          age: null,
-          height: null,
-          weight: null,
-          goal: 'muscle_gain',
-          experienceLevel: 'beginner',
-          units: 'metric',
-        },
-        subscription: 'free',
-      };
-      setUser(newUser);
-      setIsAuthenticated(true);
-      await AsyncStorage.setItem(STORAGE_KEYS.USER, JSON.stringify(newUser));
-      await AsyncStorage.setItem(STORAGE_KEYS.IS_AUTHENTICATED, JSON.stringify(true));
-      return true;
+      if (fsBodyWeights.status === 'fulfilled' && fsBodyWeights.value.length > 0) {
+        setBodyWeights(fsBodyWeights.value as BodyWeight[]);
+        await AsyncStorage.setItem(STORAGE_KEYS.BODY_WEIGHTS, JSON.stringify(fsBodyWeights.value));
+      }
+      if (fsMeasurements.status === 'fulfilled' && fsMeasurements.value.length > 0) {
+        setMeasurements(fsMeasurements.value as BodyMeasurement[]);
+        await AsyncStorage.setItem(STORAGE_KEYS.MEASUREMENTS, JSON.stringify(fsMeasurements.value));
+      }
+      if (fsRecords.status === 'fulfilled' && fsRecords.value.length > 0) {
+        setPersonalRecords(fsRecords.value as PersonalRecord[]);
+        await AsyncStorage.setItem(STORAGE_KEYS.RECORDS, JSON.stringify(fsRecords.value));
+      }
+      if (fsGoals.status === 'fulfilled' && fsGoals.value.length > 0) {
+        setGoals(fsGoals.value as Goal[]);
+        await AsyncStorage.setItem(STORAGE_KEYS.GOALS, JSON.stringify(fsGoals.value));
+      }
+      if (fsTemplates.status === 'fulfilled' && fsTemplates.value.length > 0) {
+        setTemplates(fsTemplates.value as WorkoutTemplate[]);
+        await AsyncStorage.setItem(STORAGE_KEYS.TEMPLATES, JSON.stringify(fsTemplates.value));
+      }
+      if (fsExercises.status === 'fulfilled' && fsExercises.value.length > 0) {
+        const custom = fsExercises.value as Exercise[];
+        setExercises([...DEFAULT_EXERCISES, ...custom]);
+        await AsyncStorage.setItem(STORAGE_KEYS.EXERCISES, JSON.stringify(custom));
+      }
+      if (fsNotifications.status === 'fulfilled' && fsNotifications.value) {
+        setNotificationSettings(fsNotifications.value as NotificationSettings);
+        await AsyncStorage.setItem(STORAGE_KEYS.NOTIFICATIONS, JSON.stringify(fsNotifications.value));
+      }
     } catch (error) {
-      console.log('Sign in error:', error);
+      console.log('syncFromFirestore error (non-critical):', error);
+    }
+  };
+
+  // ========================================
+  // Authentication
+  // ========================================
+
+  const signIn = async (email: string, password: string): Promise<boolean> => {
+    try {
+      await authService.signInWithEmail(email, password);
+      // onAuthStateChanged will fire and call handleUserLogin
+      return true;
+    } catch (error: any) {
+      console.log('Sign in error:', error.code, error.message);
       return false;
     }
   };
 
-  const signUp = async (email: string, _password: string, name: string): Promise<boolean> => {
+  const signUp = async (email: string, password: string, name: string): Promise<boolean> => {
     try {
-      const newUser: User = {
-        id: uuidv4(),
-        email,
+      const fbUser = await authService.signUpWithEmail(email, password, name);
+      // Create Firestore user profile
+      const newUser = buildUser(fbUser, { name });
+      await firestoreService.createUserProfile(fbUser.uid, {
         displayName: name,
-        createdAt: new Date().toISOString(),
-        updatedAt: new Date().toISOString(),
-        profile: {
-          name,
-          age: null,
-          height: null,
-          weight: null,
-          goal: 'muscle_gain',
-          experienceLevel: 'beginner',
-          units: 'metric',
-        },
+        email,
+        profile: newUser.profile,
         subscription: 'free',
-      };
+        hasOnboarded: false,
+      });
       setUser(newUser);
-      setIsAuthenticated(true);
       setHasOnboarded(false);
       await AsyncStorage.setItem(STORAGE_KEYS.USER, JSON.stringify(newUser));
-      await AsyncStorage.setItem(STORAGE_KEYS.IS_AUTHENTICATED, JSON.stringify(true));
+      await AsyncStorage.setItem(STORAGE_KEYS.HAS_ONBOARDED, JSON.stringify(false));
       return true;
-    } catch (error) {
-      console.log('Sign up error:', error);
+    } catch (error: any) {
+      console.log('Sign up error:', error.code, error.message);
+      return false;
+    }
+  };
+
+  const signInWithGoogle = async (idToken: string): Promise<boolean> => {
+    try {
+      const fbUser = await authService.signInWithGoogle(idToken);
+      // Check if profile exists; create if new
+      const existing = await firestoreService.getUserProfile(fbUser.uid);
+      if (!existing) {
+        const newUser = buildUser(fbUser);
+        await firestoreService.createUserProfile(fbUser.uid, {
+          displayName: fbUser.displayName || '',
+          email: fbUser.email || '',
+          photoURL: fbUser.photoURL || '',
+          profile: newUser.profile,
+          subscription: 'free',
+          hasOnboarded: false,
+        });
+      }
+      return true;
+    } catch (error: any) {
+      console.log('Google sign-in error:', error.code, error.message);
+      return false;
+    }
+  };
+
+  const signInWithApple = async (identityToken: string, nonce: string): Promise<boolean> => {
+    try {
+      const fbUser = await authService.signInWithApple(identityToken, nonce);
+      const existing = await firestoreService.getUserProfile(fbUser.uid);
+      if (!existing) {
+        const newUser = buildUser(fbUser);
+        await firestoreService.createUserProfile(fbUser.uid, {
+          displayName: fbUser.displayName || '',
+          email: fbUser.email || '',
+          profile: newUser.profile,
+          subscription: 'free',
+          hasOnboarded: false,
+        });
+      }
+      return true;
+    } catch (error: any) {
+      console.log('Apple sign-in error:', error.code, error.message);
       return false;
     }
   };
 
   const signOut = async () => {
+    try {
+      await authService.signOut();
+    } catch (error) {
+      console.log('Sign out error:', error);
+    }
     setIsAuthenticated(false);
     setHasOnboarded(false);
     setUser(null);
+    setFirebaseUser(null);
     setWorkouts([]);
     setActiveWorkout(null);
     setBodyWeights([]);
@@ -283,6 +457,16 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     setGoals([]);
     setTemplates([]);
     await AsyncStorage.multiRemove(Object.values(STORAGE_KEYS));
+  };
+
+  const sendPasswordReset = async (email: string): Promise<boolean> => {
+    try {
+      await authService.sendPasswordReset(email);
+      return true;
+    } catch (error) {
+      console.log('Password reset error:', error);
+      return false;
+    }
   };
 
   const completeOnboarding = async (profile: Partial<UserProfile>) => {
@@ -296,12 +480,24 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       setHasOnboarded(true);
       await AsyncStorage.setItem(STORAGE_KEYS.USER, JSON.stringify(updatedUser));
       await AsyncStorage.setItem(STORAGE_KEYS.HAS_ONBOARDED, JSON.stringify(true));
+
+      // Persist to Firestore
+      try {
+        await firestoreService.updateUserProfile(user.id, {
+          profile: updatedUser.profile,
+          hasOnboarded: true,
+        });
+      } catch (err) {
+        console.log('Firestore onboarding update failed (will sync later):', err);
+      }
     }
   };
 
-  // ---- User Profile ----
+  // ========================================
+  // User Profile
+  // ========================================
 
-  const updateProfile = async (profile: Partial<UserProfile>) => {
+  const updateProfileFn = async (profile: Partial<UserProfile>) => {
     if (user) {
       const updatedUser = {
         ...user,
@@ -311,6 +507,15 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       };
       setUser(updatedUser);
       await AsyncStorage.setItem(STORAGE_KEYS.USER, JSON.stringify(updatedUser));
+
+      try {
+        await firestoreService.updateUserProfile(user.id, {
+          profile: updatedUser.profile,
+          displayName: updatedUser.displayName,
+        });
+      } catch (err) {
+        console.log('Firestore profile update failed:', err);
+      }
     }
   };
 
@@ -319,10 +524,17 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       const updatedUser = { ...user, subscription: plan, updatedAt: new Date().toISOString() };
       setUser(updatedUser);
       await AsyncStorage.setItem(STORAGE_KEYS.USER, JSON.stringify(updatedUser));
+      try {
+        await firestoreService.updateUserProfile(user.id, { subscription: plan });
+      } catch (err) {
+        console.log('Firestore subscription update failed:', err);
+      }
     }
   };
 
-  // ---- Workouts ----
+  // ========================================
+  // Workouts
+  // ========================================
 
   const startWorkout = (name: string, _templateId?: string): Workout => {
     const now = new Date().toISOString();
@@ -357,6 +569,13 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       setWorkouts(updatedWorkouts);
       setActiveWorkout(null);
       await AsyncStorage.setItem(STORAGE_KEYS.WORKOUTS, JSON.stringify(updatedWorkouts));
+
+      // Save to Firestore
+      try {
+        if (user) await firestoreService.saveWorkout(user.id, completedWorkout);
+      } catch (err) {
+        console.log('Firestore workout save failed:', err);
+      }
 
       // Check for personal records
       await checkPersonalRecords(completedWorkout);
@@ -470,9 +689,16 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     const updated = workouts.filter(w => w.id !== workoutId);
     setWorkouts(updated);
     await AsyncStorage.setItem(STORAGE_KEYS.WORKOUTS, JSON.stringify(updated));
+    try {
+      if (user) await firestoreService.deleteWorkout(user.id, workoutId);
+    } catch (err) {
+      console.log('Firestore workout delete failed:', err);
+    }
   };
 
-  // ---- Exercises ----
+  // ========================================
+  // Exercises
+  // ========================================
 
   const addCustomExercise = async (exerciseData: Omit<Exercise, 'id' | 'isCustom'>): Promise<Exercise> => {
     const exercise: Exercise = { ...exerciseData, id: uuidv4(), isCustom: true };
@@ -480,10 +706,17 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     const updatedCustom = [...customExercises, exercise];
     setExercises([...DEFAULT_EXERCISES, ...updatedCustom]);
     await AsyncStorage.setItem(STORAGE_KEYS.EXERCISES, JSON.stringify(updatedCustom));
+    try {
+      if (user) await firestoreService.saveCustomExercise(user.id, exercise);
+    } catch (err) {
+      console.log('Firestore exercise save failed:', err);
+    }
     return exercise;
   };
 
-  // ---- Body Weights ----
+  // ========================================
+  // Body Weights
+  // ========================================
 
   const addBodyWeight = async (weight: number, notes?: string) => {
     const entry: BodyWeight = {
@@ -506,6 +739,12 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       };
       setUser(updatedUser);
       await AsyncStorage.setItem(STORAGE_KEYS.USER, JSON.stringify(updatedUser));
+      try {
+        await firestoreService.saveBodyWeight(user.id, entry);
+        await firestoreService.updateUserProfile(user.id, { 'profile.weight': weight });
+      } catch (err) {
+        console.log('Firestore body weight save failed:', err);
+      }
     }
   };
 
@@ -513,9 +752,16 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     const updated = bodyWeights.filter(bw => bw.id !== id);
     setBodyWeights(updated);
     await AsyncStorage.setItem(STORAGE_KEYS.BODY_WEIGHTS, JSON.stringify(updated));
+    try {
+      if (user) await firestoreService.deleteBodyWeight(user.id, id);
+    } catch (err) {
+      console.log('Firestore body weight delete failed:', err);
+    }
   };
 
-  // ---- Measurements ----
+  // ========================================
+  // Measurements
+  // ========================================
 
   const addMeasurement = async (measurement: Omit<BodyMeasurement, 'id' | 'userId' | 'date'>) => {
     const entry: BodyMeasurement = {
@@ -527,20 +773,45 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     const updated = [entry, ...measurements];
     setMeasurements(updated);
     await AsyncStorage.setItem(STORAGE_KEYS.MEASUREMENTS, JSON.stringify(updated));
+    try {
+      if (user) await firestoreService.saveMeasurement(user.id, entry);
+    } catch (err) {
+      console.log('Firestore measurement save failed:', err);
+    }
   };
 
   const deleteMeasurement = async (id: string) => {
     const updated = measurements.filter(m => m.id !== id);
     setMeasurements(updated);
     await AsyncStorage.setItem(STORAGE_KEYS.MEASUREMENTS, JSON.stringify(updated));
+    try {
+      if (user) await firestoreService.deleteMeasurement(user.id, id);
+    } catch (err) {
+      console.log('Firestore measurement delete failed:', err);
+    }
   };
 
-  // ---- Progress Photos ----
+  // ========================================
+  // Progress Photos
+  // ========================================
 
   const addProgressPhoto = async (photo: Omit<ProgressPhoto, 'id' | 'userId' | 'date'>) => {
+    const photoId = uuidv4();
+    let cloudUri = photo.uri;
+
+    // Upload to Firebase Storage
+    try {
+      if (user) {
+        cloudUri = await storageService.uploadProgressPhoto(user.id, photo.uri, photoId);
+      }
+    } catch (err) {
+      console.log('Photo upload to Firebase Storage failed, keeping local URI:', err);
+    }
+
     const entry: ProgressPhoto = {
       ...photo,
-      id: uuidv4(),
+      id: photoId,
+      uri: cloudUri,
       userId: user?.id || '',
       date: new Date().toISOString(),
     };
@@ -553,9 +824,16 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     const updated = progressPhotos.filter(p => p.id !== id);
     setProgressPhotos(updated);
     await AsyncStorage.setItem(STORAGE_KEYS.PHOTOS, JSON.stringify(updated));
+    try {
+      if (user) await storageService.deleteProgressPhoto(user.id, id);
+    } catch (err) {
+      console.log('Firestore photo delete failed:', err);
+    }
   };
 
-  // ---- Personal Records ----
+  // ========================================
+  // Personal Records
+  // ========================================
 
   const checkPersonalRecords = async (workout: Workout) => {
     const newRecords: PersonalRecord[] = [];
@@ -594,10 +872,23 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       ];
       setPersonalRecords(updatedRecords);
       await AsyncStorage.setItem(STORAGE_KEYS.RECORDS, JSON.stringify(updatedRecords));
+
+      // Save each new record to Firestore
+      try {
+        if (user) {
+          for (const record of newRecords) {
+            await firestoreService.savePersonalRecord(user.id, record);
+          }
+        }
+      } catch (err) {
+        console.log('Firestore PR save failed:', err);
+      }
     }
   };
 
-  // ---- Goals ----
+  // ========================================
+  // Goals
+  // ========================================
 
   const addGoal = async (goalData: Omit<Goal, 'id' | 'userId' | 'createdAt' | 'isCompleted'>) => {
     const goal: Goal = {
@@ -610,23 +901,40 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     const updated = [goal, ...goals];
     setGoals(updated);
     await AsyncStorage.setItem(STORAGE_KEYS.GOALS, JSON.stringify(updated));
+    try {
+      if (user) await firestoreService.saveGoal(user.id, goal);
+    } catch (err) {
+      console.log('Firestore goal save failed:', err);
+    }
   };
 
-  const updateGoal = async (id: string, updates: Partial<Goal>) => {
+  const updateGoalFn = async (id: string, updates: Partial<Goal>) => {
     const updated = goals.map(g => (g.id === id ? { ...g, ...updates } : g));
     setGoals(updated);
     await AsyncStorage.setItem(STORAGE_KEYS.GOALS, JSON.stringify(updated));
+    try {
+      if (user) await firestoreService.updateGoal(user.id, id, updates);
+    } catch (err) {
+      console.log('Firestore goal update failed:', err);
+    }
   };
 
   const deleteGoal = async (id: string) => {
     const updated = goals.filter(g => g.id !== id);
     setGoals(updated);
     await AsyncStorage.setItem(STORAGE_KEYS.GOALS, JSON.stringify(updated));
+    try {
+      if (user) await firestoreService.deleteGoal(user.id, id);
+    } catch (err) {
+      console.log('Firestore goal delete failed:', err);
+    }
   };
 
-  // ---- Templates ----
+  // ========================================
+  // Templates
+  // ========================================
 
-  const saveTemplate = async (templateData: Omit<WorkoutTemplate, 'id' | 'userId' | 'createdAt' | 'timesUsed'>) => {
+  const saveTemplateFn = async (templateData: Omit<WorkoutTemplate, 'id' | 'userId' | 'createdAt' | 'timesUsed'>) => {
     const template: WorkoutTemplate = {
       ...templateData,
       id: uuidv4(),
@@ -637,43 +945,69 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     const updated = [template, ...templates];
     setTemplates(updated);
     await AsyncStorage.setItem(STORAGE_KEYS.TEMPLATES, JSON.stringify(updated));
+    try {
+      if (user) await firestoreService.saveTemplate(user.id, template);
+    } catch (err) {
+      console.log('Firestore template save failed:', err);
+    }
   };
 
   const deleteTemplate = async (id: string) => {
     const updated = templates.filter(t => t.id !== id);
     setTemplates(updated);
     await AsyncStorage.setItem(STORAGE_KEYS.TEMPLATES, JSON.stringify(updated));
+    try {
+      if (user) await firestoreService.deleteTemplate(user.id, id);
+    } catch (err) {
+      console.log('Firestore template delete failed:', err);
+    }
   };
 
-  // ---- Notifications ----
+  // ========================================
+  // Notifications
+  // ========================================
 
-  const updateNotificationSettings = async (settings: Partial<NotificationSettings>) => {
+  const updateNotificationSettingsFn = async (settings: Partial<NotificationSettings>) => {
     const updated = { ...notificationSettings, ...settings };
     setNotificationSettings(updated);
     await AsyncStorage.setItem(STORAGE_KEYS.NOTIFICATIONS, JSON.stringify(updated));
+    try {
+      if (user) await firestoreService.saveNotificationSettings(user.id, updated);
+    } catch (err) {
+      console.log('Firestore notification settings save failed:', err);
+    }
   };
 
-  // ---- Helpers ----
+  // ========================================
+  // Helpers
+  // ========================================
 
   const estimateCalories = (workout: Workout, durationSeconds: number): number => {
-    // Simple calorie estimation based on workout duration and intensity
     const durationMinutes = durationSeconds / 60;
-    const baseBurnPerMinute = 5; // average for weight training
-    const exerciseCount = workout.exercises.length;
+    const baseBurnPerMinute = 5;
+    const exerciseCount = workout.exercises.length || 1;
     const totalSets = workout.exercises.reduce((acc, ex) => acc + ex.sets.length, 0);
     const intensityMultiplier = Math.min(1.5, 1 + (totalSets / exerciseCount) * 0.05);
     return Math.round(durationMinutes * baseBurnPerMinute * intensityMultiplier);
   };
 
+  // ========================================
+  // Context Value
+  // ========================================
+
   const value: AppContextType = {
     isAuthenticated,
     hasOnboarded,
     user,
+    firebaseUser,
     signIn,
     signUp,
+    signInWithGoogle,
+    signInWithApple,
     signOut,
+    sendPasswordReset,
     completeOnboarding,
-    updateProfile,
+    updateProfile: updateProfileFn,
     updateSubscription,
     workouts,
     activeWorkout,
@@ -701,13 +1035,13 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     personalRecords,
     goals,
     addGoal,
-    updateGoal,
+    updateGoal: updateGoalFn,
     deleteGoal,
     templates,
-    saveTemplate,
+    saveTemplate: saveTemplateFn,
     deleteTemplate,
     notificationSettings,
-    updateNotificationSettings,
+    updateNotificationSettings: updateNotificationSettingsFn,
     isLoading,
   };
 

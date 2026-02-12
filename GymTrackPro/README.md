@@ -74,7 +74,7 @@ A modern, cross-platform gym tracking mobile application built with React Native
 | Notifications | Expo Notifications |
 | Image Picker | Expo Image Picker |
 | Icons | @expo/vector-icons (Ionicons) |
-| Backend (ready) | Firebase (Auth, Firestore, Storage, Analytics) |
+| Backend | Firebase (Auth, Firestore, Storage) - **integrated** |
 
 ## Project Structure
 
@@ -118,7 +118,7 @@ GymTrackPro/
     │   └── Profile/
     │       └── ProfileScreen.tsx     # User profile, goals, settings
     ├── services/
-    │   ├── firebase.ts              # Firebase configuration template
+    │   ├── firebase.ts              # Firebase init, Auth, Firestore & Storage services
     │   └── notifications.ts         # Notification service
     ├── types/
     │   └── index.ts                 # TypeScript type definitions
@@ -164,23 +164,41 @@ npx expo start
 
 ## Firebase Integration
 
-To enable full backend functionality:
+Firebase is fully integrated using the Firebase JS SDK (v11+). The project is connected to the
+`gymtrackpro-dc0a4` Firebase project.
 
-1. Create a Firebase project at [console.firebase.google.com](https://console.firebase.google.com)
-2. Enable Authentication providers (Email/Password, Google, Apple)
-3. Create a Firestore database
-4. Set up Firebase Storage
-5. Enable Firebase Analytics
-6. Install Firebase packages:
+### What's Configured
 
-```bash
-npx expo install @react-native-firebase/app @react-native-firebase/auth
-npx expo install @react-native-firebase/firestore @react-native-firebase/storage
-npx expo install @react-native-firebase/analytics
-```
+- **Authentication** -- Email/password, Google Sign-In (credential-based), Apple Sign-In (credential-based)
+- **Firestore** -- All user data (workouts, body weights, measurements, goals, templates, personal records, custom exercises, notification settings) synced per-user under `users/{uid}/...`
+- **Firebase Storage** -- Progress photos uploaded to `users/{uid}/progress-photos/`
+- **Offline-first** -- AsyncStorage is used as a local cache; Firestore syncs in the background. The app works fully offline.
 
-7. Update `src/services/firebase.ts` with your Firebase config
-8. Add `google-services.json` (Android) and `GoogleService-Info.plist` (iOS)
+### Enabling Google & Apple Sign-In on Device
+
+Google and Apple sign-in require native modules that don't run in Expo Go. To enable them:
+
+1. Build with EAS: `eas build --platform ios`
+2. For Google Sign-In, install `expo-auth-session` or `@react-native-google-signin/google-signin`
+3. For Apple Sign-In, install `expo-apple-authentication`
+4. See `LoginScreen.tsx` for integration guidance comments
+
+### Adding Android Support
+
+1. Register an Android app in the Firebase console with package name `gymtrackpro`
+2. Download `google-services.json` and place it in the project root
+3. Add to `app.json`:
+   ```json
+   "android": { "googleServicesFile": "./google-services.json" }
+   ```
+
+### Files
+
+| File | Purpose |
+|------|---------|
+| `GoogleService-Info.plist` | iOS Firebase config |
+| `src/services/firebase.ts` | Firebase init + Auth, Firestore, Storage services |
+| `src/contexts/AppContext.tsx` | Data layer with Firebase + AsyncStorage |
 
 ## Future Roadmap
 

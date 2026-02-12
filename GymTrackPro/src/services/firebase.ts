@@ -1,95 +1,342 @@
 // ==========================================
-// GymTrack Pro - Firebase Configuration
-// ==========================================
-//
-// This file provides the Firebase setup template.
-// To enable Firebase features, follow these steps:
-//
-// 1. Create a Firebase project at https://console.firebase.google.com
-// 2. Enable Authentication (Email/Password, Google, Apple)
-// 3. Set up Firestore Database
-// 4. Set up Firebase Storage (for progress photos)
-// 5. Enable Firebase Analytics
-// 6. Install Firebase packages:
-//    npx expo install @react-native-firebase/app @react-native-firebase/auth
-//    npx expo install @react-native-firebase/firestore @react-native-firebase/storage
-//    npx expo install @react-native-firebase/analytics
-// 7. Replace the placeholder config below with your actual Firebase config
-// 8. Download google-services.json (Android) and GoogleService-Info.plist (iOS)
-//    and place them in the project root
-//
+// GymTrack Pro - Firebase Configuration & Services
 // ==========================================
 
-// Firebase configuration template
-// Replace with your actual Firebase project configuration
-export const firebaseConfig = {
-  apiKey: 'YOUR_API_KEY',
-  authDomain: 'YOUR_PROJECT_ID.firebaseapp.com',
-  projectId: 'YOUR_PROJECT_ID',
-  storageBucket: 'YOUR_PROJECT_ID.appspot.com',
-  messagingSenderId: 'YOUR_MESSAGING_SENDER_ID',
-  appId: 'YOUR_APP_ID',
-  measurementId: 'YOUR_MEASUREMENT_ID',
+import { initializeApp, getApps, getApp } from 'firebase/app';
+import {
+  getAuth,
+  signInWithEmailAndPassword,
+  createUserWithEmailAndPassword,
+  signOut as firebaseSignOut,
+  updateProfile,
+  onAuthStateChanged,
+  User as FirebaseUser,
+  GoogleAuthProvider,
+  OAuthProvider,
+  signInWithCredential,
+  sendPasswordResetEmail,
+} from 'firebase/auth';
+import {
+  getFirestore,
+  doc,
+  setDoc,
+  getDoc,
+  getDocs,
+  updateDoc,
+  deleteDoc,
+  collection,
+  query,
+  where,
+  orderBy,
+  Timestamp,
+  serverTimestamp,
+} from 'firebase/firestore';
+import {
+  getStorage,
+  ref,
+  uploadBytes,
+  getDownloadURL,
+  deleteObject,
+} from 'firebase/storage';
+
+// ==========================================
+// Firebase Configuration
+// Extracted from GoogleService-Info.plist
+// ==========================================
+const firebaseConfig = {
+  apiKey: 'AIzaSyA-hRe5Rvw_VoSgmGdI-CHnagUuxH5Jsgk',
+  authDomain: 'gymtrackpro-dc0a4.firebaseapp.com',
+  databaseURL: 'https://gymtrackpro-dc0a4-default-rtdb.europe-west1.firebasedatabase.app',
+  projectId: 'gymtrackpro-dc0a4',
+  storageBucket: 'gymtrackpro-dc0a4.firebasestorage.app',
+  messagingSenderId: '294195477862',
+  appId: '1:294195477862:ios:5fe317782bc6a1a41adca7',
+};
+
+// Initialize Firebase (prevent double-initialization)
+const app = getApps().length === 0 ? initializeApp(firebaseConfig) : getApp();
+const auth = getAuth(app);
+const db = getFirestore(app);
+const storage = getStorage(app);
+
+export { app, auth, db, storage };
+
+// ==========================================
+// Auth Service
+// ==========================================
+
+export const authService = {
+  /**
+   * Sign in with email & password
+   */
+  signInWithEmail: async (email: string, password: string) => {
+    const userCredential = await signInWithEmailAndPassword(auth, email, password);
+    return userCredential.user;
+  },
+
+  /**
+   * Sign up with email & password
+   */
+  signUpWithEmail: async (email: string, password: string, displayName: string) => {
+    const userCredential = await createUserWithEmailAndPassword(auth, email, password);
+    await updateProfile(userCredential.user, { displayName });
+    return userCredential.user;
+  },
+
+  /**
+   * Sign in with Google credential
+   * (The actual Google sign-in prompt is handled by expo-auth-session or
+   *  @react-native-google-signin; this takes the resulting idToken.)
+   */
+  signInWithGoogle: async (idToken: string) => {
+    const credential = GoogleAuthProvider.credential(idToken);
+    const userCredential = await signInWithCredential(auth, credential);
+    return userCredential.user;
+  },
+
+  /**
+   * Sign in with Apple credential
+   * (The actual Apple sign-in prompt is handled by expo-apple-authentication;
+   *  this takes the resulting identityToken and nonce.)
+   */
+  signInWithApple: async (identityToken: string, nonce: string) => {
+    const provider = new OAuthProvider('apple.com');
+    const credential = provider.credential({ idToken: identityToken, rawNonce: nonce });
+    const userCredential = await signInWithCredential(auth, credential);
+    return userCredential.user;
+  },
+
+  /**
+   * Sign out
+   */
+  signOut: async () => {
+    await firebaseSignOut(auth);
+  },
+
+  /**
+   * Send password reset email
+   */
+  sendPasswordReset: async (email: string) => {
+    await sendPasswordResetEmail(auth, email);
+  },
+
+  /**
+   * Get the currently signed-in user
+   */
+  getCurrentUser: (): FirebaseUser | null => {
+    return auth.currentUser;
+  },
+
+  /**
+   * Subscribe to auth state changes
+   */
+  onAuthStateChanged: (callback: (user: FirebaseUser | null) => void) => {
+    return onAuthStateChanged(auth, callback);
+  },
 };
 
 // ==========================================
-// Firebase Service Interfaces
-// These would be used once Firebase is integrated
+// Firestore Service
 // ==========================================
 
-export interface FirebaseAuthService {
-  signInWithEmail: (email: string, password: string) => Promise<any>;
-  signUpWithEmail: (email: string, password: string) => Promise<any>;
-  signInWithGoogle: () => Promise<any>;
-  signInWithApple: () => Promise<any>;
-  signOut: () => Promise<void>;
-  getCurrentUser: () => any;
-  onAuthStateChanged: (callback: (user: any) => void) => () => void;
-}
+export const firestoreService = {
+  // ---- Users ----
 
-export interface FirestoreService {
-  // Users
-  createUser: (userId: string, data: any) => Promise<void>;
-  getUser: (userId: string) => Promise<any>;
-  updateUser: (userId: string, data: any) => Promise<void>;
+  createUserProfile: async (userId: string, data: Record<string, any>) => {
+    await setDoc(doc(db, 'users', userId), {
+      ...data,
+      createdAt: serverTimestamp(),
+      updatedAt: serverTimestamp(),
+    });
+  },
 
-  // Workouts
-  saveWorkout: (userId: string, workout: any) => Promise<void>;
-  getWorkouts: (userId: string) => Promise<any[]>;
-  deleteWorkout: (userId: string, workoutId: string) => Promise<void>;
+  getUserProfile: async (userId: string) => {
+    const docSnap = await getDoc(doc(db, 'users', userId));
+    return docSnap.exists() ? { id: docSnap.id, ...docSnap.data() } : null;
+  },
 
-  // Body Data
-  saveBodyWeight: (userId: string, data: any) => Promise<void>;
-  getBodyWeights: (userId: string) => Promise<any[]>;
-  saveMeasurement: (userId: string, data: any) => Promise<void>;
-  getMeasurements: (userId: string) => Promise<any[]>;
+  updateUserProfile: async (userId: string, data: Record<string, any>) => {
+    await updateDoc(doc(db, 'users', userId), {
+      ...data,
+      updatedAt: serverTimestamp(),
+    });
+  },
 
-  // Personal Records
-  savePersonalRecord: (userId: string, data: any) => Promise<void>;
-  getPersonalRecords: (userId: string) => Promise<any[]>;
+  // ---- Workouts ----
 
-  // Goals
-  saveGoal: (userId: string, data: any) => Promise<void>;
-  getGoals: (userId: string) => Promise<any[]>;
-  updateGoal: (userId: string, goalId: string, data: any) => Promise<void>;
-  deleteGoal: (userId: string, goalId: string) => Promise<void>;
-}
+  saveWorkout: async (userId: string, workout: Record<string, any>) => {
+    await setDoc(doc(db, 'users', userId, 'workouts', workout.id), {
+      ...workout,
+      createdAt: serverTimestamp(),
+    });
+  },
 
-export interface FirebaseStorageService {
-  uploadProgressPhoto: (userId: string, uri: string) => Promise<string>;
-  deleteProgressPhoto: (userId: string, photoUrl: string) => Promise<void>;
-}
+  getWorkouts: async (userId: string) => {
+    const q = query(
+      collection(db, 'users', userId, 'workouts'),
+      orderBy('createdAt', 'desc')
+    );
+    const snap = await getDocs(q);
+    return snap.docs.map(d => ({ id: d.id, ...d.data() }));
+  },
 
-export interface FirebaseAnalyticsService {
-  logEvent: (name: string, params?: Record<string, any>) => Promise<void>;
-  logWorkoutCompleted: (workout: any) => Promise<void>;
-  logPersonalRecord: (exercise: string, weight: number) => Promise<void>;
-  logScreenView: (screenName: string) => Promise<void>;
-}
+  deleteWorkout: async (userId: string, workoutId: string) => {
+    await deleteDoc(doc(db, 'users', userId, 'workouts', workoutId));
+  },
+
+  // ---- Body Weights ----
+
+  saveBodyWeight: async (userId: string, entry: Record<string, any>) => {
+    await setDoc(doc(db, 'users', userId, 'bodyWeights', entry.id), {
+      ...entry,
+      createdAt: serverTimestamp(),
+    });
+  },
+
+  getBodyWeights: async (userId: string) => {
+    const q = query(
+      collection(db, 'users', userId, 'bodyWeights'),
+      orderBy('createdAt', 'desc')
+    );
+    const snap = await getDocs(q);
+    return snap.docs.map(d => ({ id: d.id, ...d.data() }));
+  },
+
+  deleteBodyWeight: async (userId: string, entryId: string) => {
+    await deleteDoc(doc(db, 'users', userId, 'bodyWeights', entryId));
+  },
+
+  // ---- Measurements ----
+
+  saveMeasurement: async (userId: string, entry: Record<string, any>) => {
+    await setDoc(doc(db, 'users', userId, 'measurements', entry.id), {
+      ...entry,
+      createdAt: serverTimestamp(),
+    });
+  },
+
+  getMeasurements: async (userId: string) => {
+    const q = query(
+      collection(db, 'users', userId, 'measurements'),
+      orderBy('createdAt', 'desc')
+    );
+    const snap = await getDocs(q);
+    return snap.docs.map(d => ({ id: d.id, ...d.data() }));
+  },
+
+  deleteMeasurement: async (userId: string, entryId: string) => {
+    await deleteDoc(doc(db, 'users', userId, 'measurements', entryId));
+  },
+
+  // ---- Personal Records ----
+
+  savePersonalRecord: async (userId: string, record: Record<string, any>) => {
+    await setDoc(doc(db, 'users', userId, 'personalRecords', record.id), {
+      ...record,
+      createdAt: serverTimestamp(),
+    });
+  },
+
+  getPersonalRecords: async (userId: string) => {
+    const snap = await getDocs(collection(db, 'users', userId, 'personalRecords'));
+    return snap.docs.map(d => ({ id: d.id, ...d.data() }));
+  },
+
+  // ---- Goals ----
+
+  saveGoal: async (userId: string, goal: Record<string, any>) => {
+    await setDoc(doc(db, 'users', userId, 'goals', goal.id), {
+      ...goal,
+      createdAt: serverTimestamp(),
+    });
+  },
+
+  getGoals: async (userId: string) => {
+    const snap = await getDocs(collection(db, 'users', userId, 'goals'));
+    return snap.docs.map(d => ({ id: d.id, ...d.data() }));
+  },
+
+  updateGoal: async (userId: string, goalId: string, data: Record<string, any>) => {
+    await updateDoc(doc(db, 'users', userId, 'goals', goalId), data);
+  },
+
+  deleteGoal: async (userId: string, goalId: string) => {
+    await deleteDoc(doc(db, 'users', userId, 'goals', goalId));
+  },
+
+  // ---- Templates ----
+
+  saveTemplate: async (userId: string, template: Record<string, any>) => {
+    await setDoc(doc(db, 'users', userId, 'templates', template.id), {
+      ...template,
+      createdAt: serverTimestamp(),
+    });
+  },
+
+  getTemplates: async (userId: string) => {
+    const snap = await getDocs(collection(db, 'users', userId, 'templates'));
+    return snap.docs.map(d => ({ id: d.id, ...d.data() }));
+  },
+
+  deleteTemplate: async (userId: string, templateId: string) => {
+    await deleteDoc(doc(db, 'users', userId, 'templates', templateId));
+  },
+
+  // ---- Custom Exercises ----
+
+  saveCustomExercise: async (userId: string, exercise: Record<string, any>) => {
+    await setDoc(doc(db, 'users', userId, 'customExercises', exercise.id), exercise);
+  },
+
+  getCustomExercises: async (userId: string) => {
+    const snap = await getDocs(collection(db, 'users', userId, 'customExercises'));
+    return snap.docs.map(d => ({ id: d.id, ...d.data() }));
+  },
+
+  // ---- Notification Settings ----
+
+  saveNotificationSettings: async (userId: string, settings: Record<string, any>) => {
+    await setDoc(doc(db, 'users', userId, 'settings', 'notifications'), settings);
+  },
+
+  getNotificationSettings: async (userId: string) => {
+    const docSnap = await getDoc(doc(db, 'users', userId, 'settings', 'notifications'));
+    return docSnap.exists() ? docSnap.data() : null;
+  },
+};
 
 // ==========================================
-// Placeholder implementations
-// Replace with actual Firebase SDK calls
+// Storage Service
+// ==========================================
+
+export const storageService = {
+  /**
+   * Upload a progress photo and return the download URL
+   */
+  uploadProgressPhoto: async (userId: string, localUri: string, photoId: string): Promise<string> => {
+    const response = await fetch(localUri);
+    const blob = await response.blob();
+    const storageRef = ref(storage, `users/${userId}/progress-photos/${photoId}.jpg`);
+    await uploadBytes(storageRef, blob);
+    return await getDownloadURL(storageRef);
+  },
+
+  /**
+   * Delete a progress photo from storage
+   */
+  deleteProgressPhoto: async (userId: string, photoId: string): Promise<void> => {
+    const storageRef = ref(storage, `users/${userId}/progress-photos/${photoId}.jpg`);
+    try {
+      await deleteObject(storageRef);
+    } catch (error) {
+      // File may not exist in storage, that's ok
+      console.log('Photo delete error (may not exist in cloud):', error);
+    }
+  },
+};
+
+// ==========================================
+// Analytics Events
 // ==========================================
 
 export const analyticsEvents = {

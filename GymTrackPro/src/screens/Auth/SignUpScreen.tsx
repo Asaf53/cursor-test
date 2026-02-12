@@ -49,10 +49,19 @@ export const SignUpScreen: React.FC<{ navigation: any }> = ({ navigation }) => {
     try {
       const success = await signUp(email.trim(), password, name.trim());
       if (!success) {
-        Alert.alert('Sign Up Failed', 'Please try again.');
+        Alert.alert(
+          'Sign Up Failed',
+          'Could not create account. The email may already be in use, or there was a network issue. Please try again.'
+        );
       }
-    } catch (error) {
-      Alert.alert('Error', 'Something went wrong. Please try again.');
+    } catch (error: any) {
+      const message =
+        error?.code === 'auth/email-already-in-use'
+          ? 'An account with this email already exists.'
+          : error?.code === 'auth/weak-password'
+          ? 'Password is too weak. Please use at least 6 characters.'
+          : 'Something went wrong. Please try again.';
+      Alert.alert('Sign Up Failed', message);
     } finally {
       setLoading(false);
     }
