@@ -47,20 +47,19 @@ export const SignUpScreen: React.FC<{ navigation: any }> = ({ navigation }) => {
     if (!validate()) return;
     setLoading(true);
     try {
-      const success = await signUp(email.trim(), password, name.trim());
-      if (!success) {
+      const result = await signUp(email.trim(), password, name.trim());
+
+      if (result === 'needs_confirmation') {
+        // Supabase email confirmation is enabled -- user must verify email
         Alert.alert(
-          'Sign Up Failed',
-          'Could not create account. The email may already be in use, or there was a network issue. Please try again.'
+          'Check Your Email',
+          `We've sent a confirmation link to ${email.trim()}. Please open it to activate your account, then come back and sign in.`,
+          [{ text: 'OK', onPress: () => navigation.goBack() }]
         );
       }
+      // If result === 'signed_in', onAuthStateChange will handle navigation automatically
     } catch (error: any) {
-      const message =
-        error?.code === 'auth/email-already-in-use'
-          ? 'An account with this email already exists.'
-          : error?.code === 'auth/weak-password'
-          ? 'Password is too weak. Please use at least 6 characters.'
-          : 'Something went wrong. Please try again.';
+      const message = error?.message || 'Something went wrong. Please try again.';
       Alert.alert('Sign Up Failed', message);
     } finally {
       setLoading(false);
