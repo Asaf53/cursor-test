@@ -73,27 +73,42 @@ class LargeSecureStore {
 // ==========================================
 // Supabase Configuration
 // ==========================================
-// These are your Supabase project credentials.
-// Replace with your actual values from:
-//   https://supabase.com/dashboard/project/YOUR_PROJECT/settings/api
+// *** YOU MUST REPLACE THESE WITH YOUR REAL VALUES ***
 //
-// The ANON key is safe to embed in client-side code (it relies on
-// Row Level Security policies for protection).
+// 1. Go to https://supabase.com/dashboard
+// 2. Select your project
+// 3. Go to Settings > API
+// 4. Copy "Project URL" and "anon public" key
 // ==========================================
 
 const SUPABASE_URL = 'https://YOUR_PROJECT_ID.supabase.co';
 const SUPABASE_ANON_KEY = 'YOUR_SUPABASE_ANON_KEY';
 
-const supabase: SupabaseClient = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
-  auth: {
-    storage: new LargeSecureStore(),
-    autoRefreshToken: true,
-    persistSession: true,
-    detectSessionInUrl: false,
-  },
-});
+// Detect placeholder credentials and warn loudly
+const IS_CONFIGURED = !SUPABASE_URL.includes('YOUR_PROJECT_ID') && !SUPABASE_ANON_KEY.includes('YOUR_SUPABASE_ANON_KEY');
 
-export { supabase };
+if (!IS_CONFIGURED) {
+  console.error(
+    '\n⚠️  SUPABASE NOT CONFIGURED ⚠️\n' +
+    'Open src/services/supabase.ts and replace SUPABASE_URL and SUPABASE_ANON_KEY\n' +
+    'with your real values from: https://supabase.com/dashboard/project/YOUR_PROJECT/settings/api\n'
+  );
+}
+
+const supabase: SupabaseClient = createClient(
+  IS_CONFIGURED ? SUPABASE_URL : 'https://placeholder.supabase.co',
+  IS_CONFIGURED ? SUPABASE_ANON_KEY : 'placeholder',
+  {
+    auth: {
+      storage: new LargeSecureStore(),
+      autoRefreshToken: true,
+      persistSession: true,
+      detectSessionInUrl: false,
+    },
+  }
+);
+
+export { supabase, IS_CONFIGURED };
 export type { Session, SupabaseUser };
 
 // ==========================================
@@ -184,6 +199,18 @@ export const authService = {
   /** Sign out */
   signOut: async () => {
     const { error } = await supabase.auth.signOut();
+    if (error) throw error;
+  },
+
+  /** Resend the confirmation email for a user who signed up but hasn't verified */
+  resendConfirmationEmail: async (email: string) => {
+    const { error } = await supabase.auth.resend({
+      type: 'signup',
+      email,
+      options: {
+        emailRedirectTo: 'gymtrackpro://auth/callback',
+      },
+    });
     if (error) throw error;
   },
 

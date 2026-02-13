@@ -23,7 +23,7 @@ import { FONT_SIZE, FONT_WEIGHT, SPACING, BORDER_RADIUS } from '../../constants/
 
 export const SignUpScreen: React.FC<{ navigation: any }> = ({ navigation }) => {
   const { colors } = useTheme();
-  const { signUp } = useApp();
+  const { signUp, resendConfirmationEmail } = useApp();
   const [name, setName] = useState('');
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
@@ -54,7 +54,22 @@ export const SignUpScreen: React.FC<{ navigation: any }> = ({ navigation }) => {
         Alert.alert(
           'Check Your Email',
           `We've sent a confirmation link to ${email.trim()}. Please open it to activate your account, then come back and sign in.`,
-          [{ text: 'OK', onPress: () => navigation.goBack() }]
+          [
+            {
+              text: 'Resend Email',
+              onPress: async () => {
+                const sent = await resendConfirmationEmail(email.trim());
+                Alert.alert(
+                  sent ? 'Email Sent' : 'Error',
+                  sent
+                    ? 'A new confirmation email has been sent. Check your inbox (and spam folder).'
+                    : 'Could not resend email. Please try again.',
+                  [{ text: 'OK', onPress: () => navigation.goBack() }]
+                );
+              },
+            },
+            { text: 'OK', onPress: () => navigation.goBack() },
+          ]
         );
       }
       // If result === 'signed_in', onAuthStateChange will handle navigation automatically
