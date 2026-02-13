@@ -25,7 +25,7 @@ import { FONT_SIZE, FONT_WEIGHT, SPACING, BORDER_RADIUS } from '../../constants/
 
 export const LoginScreen: React.FC<{ navigation: any }> = ({ navigation }) => {
   const { colors } = useTheme();
-  const { signIn, signInWithGoogle, signInWithApple, handleOAuthCallback, sendPasswordReset } = useApp();
+  const { signIn, signInWithGoogle, signInWithApple, handleOAuthCallback, sendPasswordReset, resendConfirmationEmail, isSupabaseConfigured } = useApp();
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [loading, setLoading] = useState(false);
@@ -54,7 +54,30 @@ export const LoginScreen: React.FC<{ navigation: any }> = ({ navigation }) => {
         );
       }
     } catch (error: any) {
-      Alert.alert('Login Failed', error?.message || 'Something went wrong. Please try again.');
+      const msg = error?.message || 'Something went wrong.';
+      // Check if the error is about email not confirmed
+      if (msg.toLowerCase().includes('email not confirmed')) {
+        Alert.alert(
+          'Email Not Confirmed',
+          'Please check your inbox and click the confirmation link. Didn\'t get it?',
+          [
+            { text: 'Cancel', style: 'cancel' },
+            {
+              text: 'Resend Email',
+              onPress: async () => {
+                const sent = await resendConfirmationEmail(email.trim());
+                if (sent) {
+                  Alert.alert('Email Sent', 'A new confirmation email has been sent. Check your inbox.');
+                } else {
+                  Alert.alert('Error', 'Could not resend email. Please try again.');
+                }
+              },
+            },
+          ]
+        );
+      } else {
+        Alert.alert('Login Failed', msg);
+      }
     } finally {
       setLoading(false);
     }

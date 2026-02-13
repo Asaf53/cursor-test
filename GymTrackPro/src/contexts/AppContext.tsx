@@ -30,6 +30,7 @@ import {
   supabase,
   Session,
   SupabaseUser,
+  IS_CONFIGURED,
 } from '../services/supabase';
 
 // Local cache keys
@@ -60,7 +61,9 @@ interface AppContextType {
   handleOAuthCallback: (url: string) => Promise<boolean>;
   signOut: () => Promise<void>;
   sendPasswordReset: (email: string) => Promise<boolean>;
+  resendConfirmationEmail: (email: string) => Promise<boolean>;
   completeOnboarding: (profile: Partial<UserProfile>) => Promise<void>;
+  isSupabaseConfigured: boolean;
 
   // User
   updateProfile: (profile: Partial<UserProfile>) => Promise<void>;
@@ -394,28 +397,42 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
   // ========================================
 
   const signIn = async (email: string, password: string): Promise<boolean> => {
+    if (!IS_CONFIGURED) {
+      throw new Error('Supabase is not configured. Open src/services/supabase.ts and add your project URL and anon key.');
+    }
     try {
       await authService.signInWithEmail(email, password);
       return true;
     } catch (error: any) {
       console.log('Sign in error:', error.message);
-      return false;
+      throw error;
     }
   };
 
   const signUp = async (email: string, password: string, name: string): Promise<'signed_in' | 'needs_confirmation' | 'error'> => {
+    if (!IS_CONFIGURED) {
+      throw new Error('Supabase is not configured. Open src/services/supabase.ts and add your project URL and anon key.');
+    }
     try {
       const result = await authService.signUpWithEmail(email, password, name);
       if (result.needsConfirmation) {
-        // User was created but needs to confirm their email
         return 'needs_confirmation';
       }
-      // Session was created immediately (email confirmation disabled in Supabase)
-      // onAuthStateChange will fire and handle the rest
       return 'signed_in';
     } catch (error: any) {
       console.log('Sign up error:', error.message);
-      throw error; // Re-throw so the screen can show the right message
+      throw error;
+    }
+  };
+
+  const resendConfirmationEmail = async (email: string): Promise<boolean> => {
+    if (!IS_CONFIGURED) return false;
+    try {
+      await authService.resendConfirmationEmail(email);
+      return true;
+    } catch (error: any) {
+      console.log('Resend confirmation error:', error.message);
+      return false;
     }
   };
 
@@ -848,7 +865,8 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
   const value: AppContextType = {
     isAuthenticated, hasOnboarded, user, supabaseUser,
     signIn, signUp, signInWithGoogle, signInWithApple, handleOAuthCallback,
-    signOut, sendPasswordReset, completeOnboarding,
+    signOut, sendPasswordReset, resendConfirmationEmail, completeOnboarding,
+    isSupabaseConfigured: IS_CONFIGURED,
     updateProfile: updateProfileFn, updateSubscription,
     workouts, activeWorkout, startWorkout, finishWorkout, cancelWorkout,
     addExerciseToWorkout, removeExerciseFromWorkout,
